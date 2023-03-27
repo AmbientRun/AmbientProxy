@@ -2,7 +2,7 @@ use anyhow::anyhow;
 use futures::{SinkExt, StreamExt};
 use quinn::{RecvStream, SendStream};
 use serde::{de::DeserializeOwned, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, copy};
+use tokio::io::{copy, AsyncReadExt, AsyncWriteExt};
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
 #[derive(Debug)]
@@ -57,8 +57,10 @@ impl OutgoingStream {
     }
 }
 
-
-pub async fn read_framed<T: DeserializeOwned + std::fmt::Debug>(recv_stream: &mut RecvStream, max_size: u32) -> anyhow::Result<T> {
+pub async fn read_framed<T: DeserializeOwned + std::fmt::Debug>(
+    recv_stream: &mut RecvStream,
+    max_size: u32,
+) -> anyhow::Result<T> {
     let message_len = recv_stream.read_u32().await?;
     if message_len > max_size {
         return Err(anyhow!("Message too long: {}", message_len));
@@ -68,7 +70,10 @@ pub async fn read_framed<T: DeserializeOwned + std::fmt::Debug>(recv_stream: &mu
     Ok(bincode::deserialize(&buffer)?)
 }
 
-pub async fn write_framed<T: Serialize>(send_stream: &mut SendStream, value: &T) -> anyhow::Result<()> {
+pub async fn write_framed<T: Serialize>(
+    send_stream: &mut SendStream,
+    value: &T,
+) -> anyhow::Result<()> {
     let bytes = bincode::serialize(value)?;
     send_stream.write_u32(bytes.len() as u32).await?;
     send_stream.write_all(&bytes).await?;

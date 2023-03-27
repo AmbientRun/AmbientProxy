@@ -17,7 +17,7 @@ async fn main() -> anyhow::Result<()> {
 
     // start http listener for asset downloading
     // FIXME: move to a startup-alike mod and factor out addr to configuration
-    let http_addr = SocketAddr::from(([0, 0, 0, 0], 8999));
+    let http_addr = SocketAddr::from(([0, 0, 0, 0], 8080));
     start_http_interface(Handle::current(), TcpListener::bind(http_addr)?);
 
     tokio::spawn(async move {

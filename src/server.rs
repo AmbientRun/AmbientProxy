@@ -2,24 +2,25 @@ use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr, TcpListener},
     ops::Range,
-    sync::{Arc, RwLock},
+    sync::Arc,
 };
 
 use anyhow::anyhow;
 use axum::{http::Method, routing::get, Router};
+use bytes::Bytes;
 use flume::{Receiver, Sender};
 use futures::StreamExt;
+use parking_lot::RwLock;
 use quinn::{
     Connecting, Connection, Endpoint, RecvStream, SendStream, ServerConfig, TransportConfig,
 };
 use rustls::{Certificate, PrivateKey};
-use tokio::{
-    runtime::Handle,
-};
+use tokio::runtime::Handle;
 use tower_http::cors::CorsLayer;
 
 use crate::{
-    protocol::{ClientMessage, ServerMessage, OpenedStreamInfo, StreamRequestInfo},
+    bytes::{drop_prefix, prefix},
+    protocol::{ClientMessage, DatagramInfo, ServerMessage, StreamInfo},
     streams::{read_framed, spawn_stream_copy, write_framed, IncomingStream, OutgoingStream},
 };
 
@@ -50,8 +51,7 @@ impl ManagementServer {
         while let Some(conn) = self.endpoint.accept().await {
             match self.handle_connection(conn).await {
                 Ok((id, proxy_server)) => {
-                    // FIXME: handle that unwrap
-                    self.proxies.write().unwrap().insert(id, proxy_server);
+                    self.proxies.write().insert(id, proxy_server);
                 }
                 Err(err) => {
                     tracing::error!("Failed handling the connection: {:?}", err);
@@ -152,11 +152,12 @@ impl ProxyServer {
         });
 
         // send back the allocation details
-        server_message_sender.send_async(ServerMessage::Allocation {
-            id: allocation_id,
-            endpoint: proxy_endpoint.local_addr()?,
-        })
-        .await?;
+        server_message_sender
+            .send_async(ServerMessage::Allocation {
+                id: allocation_id,
+                endpoint: proxy_endpoint.local_addr()?,
+            })
+            .await?;
 
         Ok(Self {
             allocation_id,
@@ -176,8 +177,7 @@ impl ProxyServer {
                 Some(conn) = self.proxy_endpoint.accept() => {
                     match self.handle_connection(conn).await {
                         Ok((player_id, connection)) => {
-                            // FIXME: handle that unwrap
-                            self.player_conns.write().unwrap().insert(player_id, connection);
+                            self.player_conns.write().insert(player_id, connection);
                         }
                         Err(err) => {
                             tracing::error!("Failed to handle incoming client connection: {:?}", err);
@@ -204,6 +204,18 @@ impl ProxyServer {
                         tracing::error!("Failed to handle uni stream: {:?}", err);
                     }
                 }
+
+                // server sending a datagram to a player
+                Ok(datagram) = self.ambient_server_conn.read_datagram() => {
+                    if let Err(err) = self.handle_datagram(datagram).await {
+                        tracing::error!("Failed to handle datagram: {:?}", err);
+                    }
+                }
+
+                else => {
+                    tracing::info!("Proxy server is shutting down");
+                    break;
+                }
             }
         }
     }
@@ -223,7 +235,11 @@ impl ProxyServer {
         tracing::info!("Connected player id: {}", player_id);
 
         // notify the server
-        self.server_message_sender.send_async(ServerMessage::PlayerConnected { player_id: player_id.clone() }).await?;
+        self.server_message_sender
+            .send_async(ServerMessage::PlayerConnected {
+                player_id: player_id.clone(),
+            })
+            .await?;
 
         // create player connection to handle player side actions
         let player_connection = Arc::new(
@@ -236,7 +252,7 @@ impl ProxyServer {
             self.ambient_server_conn.open_bi().await?;
         write_framed(
             &mut server_send_stream,
-            &OpenedStreamInfo {
+            &StreamInfo {
                 player_id: player_id.clone(),
             },
         )
@@ -256,17 +272,15 @@ impl ProxyServer {
     }
 
     fn get_player_connection(&self, player_id: &str) -> Option<Connection> {
-        // FIXME: handle unwrap
         self.player_conns
             .read()
-            .unwrap()
             .get(player_id)
             .map(|p| p.get_connection())
     }
 
     async fn handle_uni(&self, mut recv_stream: RecvStream) -> anyhow::Result<()> {
         // hand decode the first message so then we can just copy the streams without decoding
-        let message: StreamRequestInfo = read_framed(&mut recv_stream, 1024).await?;
+        let message: StreamInfo = read_framed(&mut recv_stream, 1024).await?;
 
         // get player connection
         let Some(player_connection) = self.get_player_connection(&message.player_id) else {
@@ -286,7 +300,7 @@ impl ProxyServer {
         mut recv_stream: RecvStream,
     ) -> anyhow::Result<()> {
         // hand decode the first message so then we can just copy the streams without decoding
-        let message: StreamRequestInfo = read_framed(&mut recv_stream, 1024).await?;
+        let message: StreamInfo = read_framed(&mut recv_stream, 1024).await?;
 
         // get player connection
         let Some(player_connection) = self.get_player_connection(&message.player_id) else {
@@ -298,6 +312,15 @@ impl ProxyServer {
         spawn_stream_copy(recv_stream, player_send_stream);
         spawn_stream_copy(player_recv_stream, send_stream);
 
+        Ok(())
+    }
+
+    async fn handle_datagram(&self, datagram: Bytes) -> anyhow::Result<()> {
+        let (DatagramInfo { player_id }, data) = drop_prefix(datagram)?;
+        let Some(player_connection) = self.get_player_connection(&player_id) else {
+            return Err(anyhow!("Unknown player: {}", player_id));
+        };
+        player_connection.send_datagram(data)?;
         Ok(())
     }
 }
@@ -341,6 +364,19 @@ impl PlayerConnection {
                         tracing::error!("Failed to handle bi stream: {:?}", err);
                     }
                 }
+
+                // player sending a datagram to the server
+                Ok(datagram) = self.conn.read_datagram() => {
+                    if let Err(err) = self.handle_datagram(datagram).await {
+                        tracing::error!("Failed to handle datagram: {:?}", err);
+                    }
+                }
+
+                // player connection closed
+                else => {
+                    tracing::info!("Player connection closed");
+                    break;
+                }
             }
         }
     }
@@ -349,7 +385,7 @@ impl PlayerConnection {
         let mut send_stream = self.ambient_server_conn.open_uni().await?;
         write_framed(
             &mut send_stream,
-            &OpenedStreamInfo {
+            &StreamInfo {
                 player_id: self.player_id.clone(),
             },
         )
@@ -367,13 +403,23 @@ impl PlayerConnection {
             self.ambient_server_conn.open_bi().await?;
         write_framed(
             &mut server_send_stream,
-            &OpenedStreamInfo {
+            &StreamInfo {
                 player_id: self.player_id.clone(),
             },
         )
         .await?;
         spawn_stream_copy(recv_stream, server_send_stream);
         spawn_stream_copy(server_recv_stream, send_stream);
+        Ok(())
+    }
+
+    async fn handle_datagram(&self, datagram: Bytes) -> anyhow::Result<()> {
+        self.ambient_server_conn.send_datagram(prefix(
+            &DatagramInfo {
+                player_id: self.player_id.clone(),
+            },
+            datagram,
+        )?)?;
         Ok(())
     }
 }

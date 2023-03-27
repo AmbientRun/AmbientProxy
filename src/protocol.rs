@@ -22,11 +22,11 @@ pub enum ClientMessage {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct OpenedStreamInfo {
+pub struct StreamInfo {
     pub player_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct StreamRequestInfo {
+pub struct DatagramInfo {
     pub player_id: String,
 }

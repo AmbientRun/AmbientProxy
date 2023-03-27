@@ -1,3 +1,4 @@
+pub mod bytes;
 pub mod client;
 pub mod configuration;
 pub mod protocol;

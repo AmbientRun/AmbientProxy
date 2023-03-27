@@ -1,23 +1,76 @@
-use std::{net::SocketAddr, time::Duration, sync::{Arc, RwLock}, collections::{VecDeque, HashMap}, task::Poll};
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt::Debug,
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 
-use futures::Future;
-use quinn::{Endpoint, TransportConfig, ClientConfig, Connection, RecvStream};
+use bytes::Bytes;
+use parking_lot::RwLock;
+use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, TransportConfig};
 use rustls::{Certificate, RootCertStore};
+use tokio::{
+    net::{lookup_host, ToSocketAddrs},
+    sync::Notify,
+};
 
-use crate::{protocol::ServerMessage, streams::{IncomingStream, OutgoingStream, read_framed}};
+use crate::{
+    protocol::{DatagramInfo, ServerMessage, StreamInfo},
+    streams::{read_framed, write_framed, IncomingStream, OutgoingStream},
+};
 
 const CERT: &[u8] = include_bytes!("./cert.der");
 
+#[derive(Debug)]
+struct QueuedResource<T> {
+    queue: VecDeque<T>,
+    notify: Arc<Notify>,
+}
+
+impl<T> QueuedResource<T> {
+    fn push(&mut self, value: T) {
+        self.queue.push_back(value);
+        self.notify.notify_one();
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        self.queue.pop_front()
+    }
+}
+
+impl<T> Default for QueuedResource<T> {
+    fn default() -> Self {
+        Self {
+            queue: Default::default(),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PendingResources {
+    uni_streams: RwLock<HashMap<String, QueuedResource<RecvStream>>>,
+    bi_streams: RwLock<HashMap<String, QueuedResource<(SendStream, RecvStream)>>>,
+    datagrams: RwLock<HashMap<String, QueuedResource<Bytes>>>,
+}
+
 pub struct Client {
     conn: Connection,
-    allocation_id: uuid::Uuid,
-    proxy_endpoint: SocketAddr,
+    pub allocation_id: uuid::Uuid,
+    pub proxy_endpoint: SocketAddr,
     rx: IncomingStream,
-    pending_streams: RwLock<HashMap<String, VecDeque<RecvStream>>>,
+    tx: OutgoingStream, // TODO: implement assets handling
+    pending: Arc<PendingResources>,
 }
 
 impl Client {
-    pub async fn connect(server_addr: SocketAddr) -> anyhow::Result<Self> {
+    pub async fn connect<T: ToSocketAddrs + Debug + Clone>(host: T) -> anyhow::Result<Self> {
+        let server_addr = lookup_host(host.clone())
+            .await?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("{:?} not found", host))?;
+
         let mut endpoint = Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
 
         let cert = Certificate(CERT.to_vec());
@@ -49,12 +102,57 @@ impl Client {
             allocation_id,
             proxy_endpoint,
             rx,
-            pending_streams: Default::default(),
+            tx,
+            pending: Default::default(),
         })
     }
 
-    pub fn accept_uni(&self, player_id: &str) -> AcceptUni {
-        AcceptUni {  }
+    pub async fn run(
+        mut self,
+        on_player_connected: Arc<dyn Fn(String, ProxiedConnection) + Sync + Send>,
+    ) {
+        loop {
+            tokio::select! {
+                Ok(message) = self.rx.next::<ServerMessage>() => {
+                    match message {
+                        ServerMessage::Allocation { .. } => {
+                            // shouldn't happen
+                            tracing::warn!("Unexpected allocation message: {:?}", message);
+                        }
+                        ServerMessage::PlayerConnected { player_id } => {
+                            tracing::debug!("Player connected: {}", player_id);
+                            on_player_connected(player_id.clone(), ProxiedConnection { player_id, conn: self.conn.clone(), pending: self.pending.clone() });
+                        }
+                        ServerMessage::RequestAsset { key } => {
+                            tracing::debug!("Asset requested: {}", key);
+                            todo!();
+                        }
+                    }
+                }
+                Ok(mut recv_stream) = self.conn.accept_uni() => {
+                    let Ok(StreamInfo { player_id }) = read_framed(&mut recv_stream, 1024).await else {
+                        tracing::warn!("Failed to read stream info");
+                        continue;
+                    };
+                    self.pending.uni_streams.write().entry(player_id).or_default().push(recv_stream);
+                }
+                Ok((send_stream, mut recv_stream)) = self.conn.accept_bi() => {
+                    let Ok(StreamInfo { player_id }) = read_framed(&mut recv_stream, 1024).await else {
+                        tracing::warn!("Failed to read stream info");
+                        continue;
+                    };
+                    self.pending.bi_streams.write().entry(player_id).or_default().push((send_stream, recv_stream));
+                }
+                Ok(datagram) = self.conn.read_datagram() => {
+                    tracing::debug!("Datagram received");
+                    let Ok((DatagramInfo { player_id }, data)) = crate::bytes::drop_prefix(datagram) else {
+                        tracing::warn!("Failed to read datagram info");
+                        continue;
+                    };
+                    self.pending.datagrams.write().entry(player_id).or_default().push(data);
+                }
+            }
+        }
     }
 
     pub async fn dump(&mut self) {
@@ -88,15 +186,86 @@ impl Client {
     }
 }
 
-pub struct AcceptUni {
-
+#[derive(Debug, Clone)]
+pub struct ProxiedConnection {
+    conn: Connection,
+    player_id: String,
+    pending: Arc<PendingResources>,
 }
 
-impl Future for AcceptUni {
-    type Output = anyhow::Result<RecvStream>;
+impl ProxiedConnection {
+    pub async fn open_uni(&self) -> anyhow::Result<SendStream> {
+        let mut send_stream = self.conn.open_uni().await?;
+        write_framed(
+            &mut send_stream,
+            &StreamInfo {
+                player_id: self.player_id.clone(),
+            },
+        )
+        .await?;
+        Ok(send_stream)
+    }
 
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        // TODO
-        todo!()
+    pub async fn open_bi(&self) -> anyhow::Result<(SendStream, RecvStream)> {
+        let (mut send_stream, recv_stream) = self.conn.open_bi().await?;
+        write_framed(
+            &mut send_stream,
+            &StreamInfo {
+                player_id: self.player_id.clone(),
+            },
+        )
+        .await?;
+        Ok((send_stream, recv_stream))
+    }
+
+    pub async fn accept_uni(&self) -> RecvStream {
+        loop {
+            let notify = {
+                let mut map = self.pending.uni_streams.write();
+                let resource = map.entry(self.player_id.clone()).or_default();
+                if let Some(stream) = resource.pop() {
+                    return stream;
+                }
+                resource.notify.clone()
+            };
+            notify.notified().await;
+        }
+    }
+
+    pub async fn accept_bi(&self) -> (SendStream, RecvStream) {
+        loop {
+            let notify = {
+                let mut map = self.pending.bi_streams.write();
+                let resource = map.entry(self.player_id.clone()).or_default();
+                if let Some(streams) = resource.pop() {
+                    return streams;
+                }
+                resource.notify.clone()
+            };
+            notify.notified().await;
+        }
+    }
+
+    pub async fn read_datagram(&self) -> Bytes {
+        loop {
+            let notify = {
+                let mut map = self.pending.datagrams.write();
+                let resource = map.entry(self.player_id.clone()).or_default();
+                if let Some(datagram) = resource.pop() {
+                    return datagram;
+                }
+                resource.notify.clone()
+            };
+            notify.notified().await;
+        }
+    }
+
+    pub async fn send_datagram(&self, data: Bytes) -> anyhow::Result<()> {
+        Ok(self.conn.send_datagram(crate::bytes::prefix(
+            &DatagramInfo {
+                player_id: self.player_id.clone(),
+            },
+            data,
+        )?)?)
     }
 }
