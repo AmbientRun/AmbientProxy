@@ -15,7 +15,7 @@ use quinn::{
     Connecting, Connection, Endpoint, RecvStream, SendStream, ServerConfig, TransportConfig,
 };
 use rustls::{Certificate, PrivateKey};
-use tokio::runtime::Handle;
+use tokio::{runtime::Handle, sync::Notify};
 use tower_http::cors::CorsLayer;
 
 use crate::{
@@ -67,12 +67,15 @@ impl ManagementServer {
         let conn = conn.await?;
         let allocation_id = uuid::Uuid::new_v4();
         // FIXME: grab IP and ports from config
-        let proxy_server =
-            Arc::new(ProxyServer::new(conn, IpAddr::from([0, 0, 0, 0]), 9000..10000).await?);
-        tracing::info!(
-            "Created allocation {} at {}",
-            proxy_server.allocation_id,
-            proxy_server.proxy_endpoint.local_addr()?
+        let proxy_server = Arc::new(
+            ProxyServer::new(
+                allocation_id,
+                conn,
+                IpAddr::from([0, 0, 0, 0]),
+                IpAddr::from([0, 0, 0, 0]),
+                9000..10000,
+            )
+            .await?,
         );
 
         // start the proxy server
@@ -88,12 +91,16 @@ impl ManagementServer {
 }
 
 struct ProxyServer {
-    allocation_id: uuid::Uuid,
-    proxy_endpoint: Endpoint,
+    id: uuid::Uuid,
+    proxy_endpoint: RwLock<Option<Endpoint>>,
+    public_addr: IpAddr,
+    bind_addr: IpAddr,
+    ports: Range<u16>,
     ambient_server_conn: Connection,
     server_message_sender: Sender<ServerMessage>,
     client_message_receiver: Receiver<ClientMessage>,
     player_conns: RwLock<HashMap<String, Arc<PlayerConnection>>>,
+    asset_store: RwLock<HashMap<String, Asset>>,
 }
 
 impl ProxyServer {
@@ -115,56 +122,60 @@ impl ProxyServer {
     }
 
     async fn new(
+        id: uuid::Uuid,
         ambient_server_conn: Connection,
-        addr: IpAddr,
+        public_addr: IpAddr,
+        bind_addr: IpAddr,
         ports: Range<u16>,
     ) -> anyhow::Result<Self> {
-        let allocation_id = uuid::Uuid::new_v4();
-        let proxy_endpoint = Self::create_proxy_endpoint(addr, ports)?;
-
-        // open a bi stream to the newly connected server
-        let (send_stream, recv_stream) = ambient_server_conn.open_bi().await?;
-        let mut tx = OutgoingStream::new(send_stream);
-        let mut rx = IncomingStream::new(recv_stream);
-
+        // create communication channels
         let (client_message_sender, client_message_receiver) = flume::unbounded::<ClientMessage>();
         let (server_message_sender, server_message_receiver) = flume::unbounded::<ServerMessage>();
 
-        tokio::spawn(async move {
-            let mut receiver_stream = server_message_receiver.stream();
-            loop {
-                tokio::select! {
-                    Ok(message) = rx.next::<ClientMessage>() => {
-                        tracing::debug!("Got message from server: {:?}", message);
-                        if let Err(err) = client_message_sender.send_async(message).await {
-                            tracing::error!("Error processing message from the server: {:?}", err);
+        {
+            let ambient_server_conn = ambient_server_conn.clone();
+            tokio::spawn(async move {
+                // accept a bi stream from the newly connected server
+                tracing::debug!("Accepting a bi stream from the game server");
+                let Ok((send_stream, recv_stream)) = ambient_server_conn.accept_bi().await else {
+                    tracing::error!("Failed to accept a bi stream from the game server");
+                    return;
+                };
+                let mut tx = OutgoingStream::new(send_stream);
+                let mut rx = IncomingStream::new(recv_stream);
+
+                tracing::debug!("Starting to message processing");
+                let mut receiver_stream = server_message_receiver.stream();
+                loop {
+                    tokio::select! {
+                        Ok(message) = rx.next::<ClientMessage>() => {
+                            tracing::debug!("Got message from server: {:?}", message);
+                            if let Err(err) = client_message_sender.send_async(message).await {
+                                tracing::error!("Error processing message from the server: {:?}", err);
+                            }
                         }
-                    }
-                    Some(message) = receiver_stream.next() => {
-                        tracing::debug!("Got message for server: {:?}", message);
-                        if let Err(err) = tx.send(&message).await {
-                            tracing::error!("Error sending message to the server: {:?}", err);
+                        Some(message) = receiver_stream.next() => {
+                            tracing::debug!("Got message for server: {:?}", message);
+                            if let Err(err) = tx.send(&message).await {
+                                tracing::error!("Error sending message to the server: {:?}", err);
+                            }
                         }
                     }
                 }
-            }
-        });
-
-        // send back the allocation details
-        server_message_sender
-            .send_async(ServerMessage::Allocation {
-                id: allocation_id,
-                endpoint: proxy_endpoint.local_addr()?,
-            })
-            .await?;
+            });
+        }
 
         Ok(Self {
-            allocation_id,
-            proxy_endpoint,
+            id,
+            proxy_endpoint: Default::default(),
+            public_addr,
+            bind_addr,
+            ports,
             ambient_server_conn,
             server_message_sender,
             client_message_receiver,
             player_conns: Default::default(),
+            asset_store: Default::default(),
         })
     }
 
@@ -173,7 +184,7 @@ impl ProxyServer {
         loop {
             tokio::select! {
                 // new player connection
-                Some(conn) = self.proxy_endpoint.accept() => {
+                Some(conn) = self.accept_connection() => {
                     match self.handle_connection(conn).await {
                         Ok((player_id, connection)) => {
                             self.player_conns.write().insert(player_id, connection);
@@ -186,8 +197,24 @@ impl ProxyServer {
 
                 // server send a message to the proxy
                 Some(message) = client_message_receiver.next() => {
-                    // TODO: process message
-                    tracing::warn!("Got a message but processing is not implemented yet: {:?}", message);
+                    tracing::debug!("Got a message from client: {:?}", message);
+                    match message {
+                        ClientMessage::AllocateEndpoint => {
+                            match self.handle_allocate_message() {
+                                Ok(allocated_endpoint_message) => {
+                                    if let Err(err) = self.server_message_sender.send_async(allocated_endpoint_message).await {
+                                        tracing::error!("Failed to send allocated endpoint message: {:?}", err);
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::error!("Failed to handle allocate message: {:?}", err);
+                                }
+                            }
+                        }
+                        ClientMessage::StoreAsset { key, data } => {
+                            self.asset_store.write().entry(key).or_default().store(data);
+                        }
+                    }
                 }
 
                 // server opening a new uni stream to a player
@@ -216,6 +243,37 @@ impl ProxyServer {
                     break;
                 }
             }
+        }
+    }
+
+    fn handle_allocate_message(&self) -> anyhow::Result<ServerMessage> {
+        if self.proxy_endpoint.read().is_some() {
+            return Err(anyhow::anyhow!("Endpoint already allocated"));
+        }
+        let Ok(endpoint) = Self::create_proxy_endpoint(self.bind_addr, self.ports.clone()) else {
+            return Err(anyhow::anyhow!("Failed to create proxy endpoint"));
+        };
+        *self.proxy_endpoint.write() = Some(endpoint.clone());
+        let Ok(local_addr) = endpoint.local_addr() else {
+            return Err(anyhow::anyhow!("Failed to get local address"));
+        };
+        let allocated_endpoint = SocketAddr::from((self.public_addr, local_addr.port()));
+        let external_endpoint = self.ambient_server_conn.remote_address();
+        Ok(ServerMessage::Allocation {
+            id: self.id,
+            allocated_endpoint,
+            external_endpoint,
+            // FIXME
+            assets_root: format!("http://{}:8080/{}", self.public_addr, self.id),
+        })
+    }
+
+    async fn accept_connection(&self) -> Option<Connecting> {
+        let endpoint_opt = self.proxy_endpoint.read().clone();
+        if let Some(proxy_endpoint) = endpoint_opt {
+            proxy_endpoint.accept().await
+        } else {
+            None
         }
     }
 
@@ -410,6 +468,19 @@ impl PlayerConnection {
             datagram,
         )?)?;
         Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct Asset {
+    data: Option<Bytes>,
+    notify: Arc<Notify>,
+}
+
+impl Asset {
+    fn store(&mut self, data: impl Into<Bytes>) {
+        self.data = Some(data.into());
+        self.notify.notify_waiters();
     }
 }
 

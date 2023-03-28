@@ -16,7 +16,7 @@ use tokio::{
 };
 
 use crate::{
-    protocol::{DatagramInfo, ServerMessage, StreamInfo},
+    protocol::{ClientMessage, DatagramInfo, ServerMessage, StreamInfo},
     streams::{read_framed, write_framed, IncomingStream, OutgoingStream},
     Result,
 };
@@ -58,20 +58,13 @@ struct PendingResources {
 
 pub struct Client {
     conn: Connection,
-    pub allocation_id: uuid::Uuid,
-    pub proxy_endpoint: SocketAddr,
     rx: IncomingStream,
-    tx: OutgoingStream, // TODO: implement assets handling
+    tx: OutgoingStream,
     pending: Arc<PendingResources>,
 }
 
 impl Client {
-    pub async fn connect<T: ToSocketAddrs + Debug + Clone>(host: T) -> Result<Self> {
-        let server_addr = lookup_host(host.clone())
-            .await?
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("{:?} not found", host))?;
-
+    pub async fn connect<T: ToSocketAddrs + Debug + Clone>(proxy_server: T) -> Result<Self> {
         let mut endpoint = Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
 
         let cert = Certificate(CERT.to_vec());
@@ -88,105 +81,137 @@ impl Client {
         client_config.transport_config(Arc::new(transport));
         endpoint.set_default_client_config(client_config);
 
+        Self::connect_using_endpoint(proxy_server, endpoint).await
+    }
+
+    pub async fn connect_using_endpoint<T: ToSocketAddrs + Debug + Clone>(
+        proxy_server: T,
+        endpoint: Endpoint,
+    ) -> Result<Self> {
+        let server_addr = lookup_host(proxy_server.clone())
+            .await?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("{:?} not found", proxy_server))?;
+
         let conn = endpoint
             .connect(server_addr, "localhost")
             .map_err(anyhow::Error::from)?
             .await?;
-        let (send_stream, recv_stream) = conn.accept_bi().await?;
-        let mut rx = IncomingStream::new(recv_stream);
+        let (send_stream, recv_stream) = conn.open_bi().await?;
+        let rx = IncomingStream::new(recv_stream);
         let tx = OutgoingStream::new(send_stream);
-        let allocation: ServerMessage = rx.next().await?;
-        let ServerMessage::Allocation { id: allocation_id, endpoint: proxy_endpoint } = allocation else {
-            return Err(anyhow::anyhow!("Unexpected proxy message: {:?}", allocation))?;
-        };
-        println!("{:?} via {:?}", allocation_id, proxy_endpoint);
 
         Ok(Self {
             conn,
-            allocation_id,
-            proxy_endpoint,
             rx,
             tx,
             pending: Default::default(),
         })
     }
 
-    pub async fn run(
-        mut self,
+    pub fn start(
+        self,
+        on_endpoint_allocated: Arc<dyn Fn(AllocatedEndpoint) + Sync + Send>,
         on_player_connected: Arc<dyn Fn(String, ProxiedConnection) + Sync + Send>,
-    ) {
-        loop {
-            tokio::select! {
-                Ok(message) = self.rx.next::<ServerMessage>() => {
-                    match message {
-                        ServerMessage::Allocation { .. } => {
-                            // shouldn't happen
-                            tracing::warn!("Unexpected allocation message: {:?}", message);
-                        }
-                        ServerMessage::PlayerConnected { player_id } => {
-                            tracing::debug!("Player connected: {}", player_id);
-                            on_player_connected(player_id.clone(), ProxiedConnection { player_id, conn: self.conn.clone(), pending: self.pending.clone() });
-                        }
-                        ServerMessage::RequestAsset { key } => {
-                            tracing::debug!("Asset requested: {}", key);
-                            todo!();
+        on_asset_requested: Arc<dyn Fn(String) + Sync + Send>,
+    ) -> ClientController {
+        let Client {
+            conn,
+            mut rx,
+            tx,
+            pending,
+        } = self;
+        let controller = ClientController { tx };
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Ok(message) = rx.next::<ServerMessage>() => {
+                        tracing::debug!("Got server message: {:?}", &message);
+                        match message {
+                            ServerMessage::Allocation { .. } => {
+                                on_endpoint_allocated(message.try_into().expect("Already matched allocation message"));
+                            }
+                            ServerMessage::PlayerConnected { player_id } => {
+                                on_player_connected(player_id.clone(), ProxiedConnection { player_id, conn: conn.clone(), pending: pending.clone() });
+                            }
+                            ServerMessage::RequestAsset { key } => {
+                                on_asset_requested(key);
+                            }
                         }
                     }
-                }
-                Ok(mut recv_stream) = self.conn.accept_uni() => {
-                    let Ok(StreamInfo { player_id }) = read_framed(&mut recv_stream, 1024).await else {
-                        tracing::warn!("Failed to read stream info");
-                        continue;
-                    };
-                    self.pending.uni_streams.write().entry(player_id).or_default().push(recv_stream);
-                }
-                Ok((send_stream, mut recv_stream)) = self.conn.accept_bi() => {
-                    let Ok(StreamInfo { player_id }) = read_framed(&mut recv_stream, 1024).await else {
-                        tracing::warn!("Failed to read stream info");
-                        continue;
-                    };
-                    self.pending.bi_streams.write().entry(player_id).or_default().push((send_stream, recv_stream));
-                }
-                Ok(datagram) = self.conn.read_datagram() => {
-                    tracing::debug!("Datagram received");
-                    let Ok((DatagramInfo { player_id }, data)) = crate::bytes::drop_prefix(datagram) else {
-                        tracing::warn!("Failed to read datagram info");
-                        continue;
-                    };
-                    self.pending.datagrams.write().entry(player_id).or_default().push(data);
+                    Ok(mut recv_stream) = conn.accept_uni() => {
+                        let Ok(StreamInfo { player_id }) = read_framed(&mut recv_stream, 1024).await else {
+                            tracing::warn!("Failed to read stream info");
+                            continue;
+                        };
+                        pending.uni_streams.write().entry(player_id).or_default().push(recv_stream);
+                    }
+                    Ok((send_stream, mut recv_stream)) = conn.accept_bi() => {
+                        let Ok(StreamInfo { player_id }) = read_framed(&mut recv_stream, 1024).await else {
+                            tracing::warn!("Failed to read stream info");
+                            continue;
+                        };
+                        pending.bi_streams.write().entry(player_id).or_default().push((send_stream, recv_stream));
+                    }
+                    Ok(datagram) = conn.read_datagram() => {
+                        tracing::debug!("Datagram received");
+                        let Ok((DatagramInfo { player_id }, data)) = crate::bytes::drop_prefix(datagram) else {
+                            tracing::warn!("Failed to read datagram info");
+                            continue;
+                        };
+                        pending.datagrams.write().entry(player_id).or_default().push(data);
+                    }
                 }
             }
+        });
+        controller
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AllocatedEndpoint {
+    pub id: uuid::Uuid,
+    pub allocated_endpoint: SocketAddr,
+    pub external_endpoint: SocketAddr,
+    pub assets_root: String,
+}
+
+impl TryFrom<ServerMessage> for AllocatedEndpoint {
+    type Error = ();
+
+    fn try_from(value: ServerMessage) -> std::result::Result<Self, Self::Error> {
+        match value {
+            ServerMessage::Allocation {
+                id,
+                allocated_endpoint,
+                external_endpoint,
+                assets_root,
+            } => Ok(Self {
+                id,
+                allocated_endpoint,
+                external_endpoint,
+                assets_root,
+            }),
+            _ => Err(()),
         }
     }
+}
 
-    pub async fn dump(&mut self) {
-        loop {
-            tokio::select! {
-                Ok(message) = self.rx.next::<ServerMessage>() => {
-                    dbg!(message);
-                }
-                Ok(recv_stream) = self.conn.accept_uni() => {
-                    let mut recv = IncomingStream::new(recv_stream);
-                    tokio::spawn(async move {
-                        let player_id: ServerMessage = recv.next().await.unwrap();
-                        dbg!(player_id);
-                        while let Ok(buf) = recv.next::<Vec<u8>>().await {
-                            dbg!(buf);
-                        }
-                    });
-                }
-                Ok((_send_stream, recv_stream)) = self.conn.accept_bi() => {
-                    let mut recv = IncomingStream::new(recv_stream);
-                    tokio::spawn(async move {
-                        let player_id: ServerMessage = recv.next().await.unwrap();
-                        dbg!(player_id);
-                        while let Ok(buf) = recv.next::<Vec<u8>>().await {
-                            dbg!(buf);
-                        }
-                    });
-                }
-            }
-        }
+pub struct ClientController {
+    tx: OutgoingStream,
+}
+
+impl ClientController {
+    pub async fn allocate_endpoint(&mut self) -> Result<()> {
+        self.tx.send(&ClientMessage::AllocateEndpoint).await?;
+        Ok(())
+    }
+
+    pub async fn store_asset(&mut self, key: String, data: Vec<u8>) -> Result<()> {
+        self.tx
+            .send(&ClientMessage::StoreAsset { key, data })
+            .await?;
+        Ok(())
     }
 }
 

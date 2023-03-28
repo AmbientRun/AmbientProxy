@@ -1,6 +1,6 @@
 pub mod bytes;
 pub mod client;
-pub mod configuration;
+pub(crate) mod configuration;
 pub mod protocol;
 pub mod server;
 pub mod streams;

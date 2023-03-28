@@ -5,8 +5,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ServerMessage {
     Allocation {
+        /// Id of this allocation
         id: uuid::Uuid,
-        endpoint: SocketAddr,
+        /// The endpoint that the players should use to connect to the server via proxy
+        allocated_endpoint: SocketAddr,
+        /// HTTP root for assets downloading
+        assets_root: String,
+        /// The endpoint that the players could try to connect to the server directly
+        external_endpoint: SocketAddr,
     },
     PlayerConnected {
         player_id: String,
@@ -18,6 +24,7 @@ pub enum ServerMessage {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ClientMessage {
+    AllocateEndpoint,
     StoreAsset { key: String, data: Vec<u8> },
 }
 
