@@ -22,6 +22,7 @@ use crate::{
     bytes::{drop_prefix, prefix},
     protocol::{ClientMessage, DatagramInfo, ServerMessage, StreamInfo},
     streams::{read_framed, spawn_stream_copy, write_framed, IncomingStream, OutgoingStream},
+    Result,
 };
 
 const CERT: &[u8] = include_bytes!("./cert.der");
@@ -33,10 +34,11 @@ pub struct ManagementServer {
 }
 
 impl ManagementServer {
-    pub fn new(server_addr: SocketAddr) -> anyhow::Result<Self> {
+    pub fn new(server_addr: SocketAddr) -> Result<Self> {
         let cert = Certificate(CERT.to_vec());
         let cert_key = PrivateKey(CERT_KEY.to_vec());
-        let mut server_conf = ServerConfig::with_single_cert(vec![cert], cert_key)?;
+        let mut server_conf =
+            ServerConfig::with_single_cert(vec![cert], cert_key).map_err(anyhow::Error::from)?;
         let mut transport = TransportConfig::default();
         transport.max_idle_timeout(None);
         server_conf.transport = Arc::new(transport);
@@ -60,10 +62,7 @@ impl ManagementServer {
         }
     }
 
-    async fn handle_connection(
-        &self,
-        conn: Connecting,
-    ) -> anyhow::Result<(uuid::Uuid, Arc<ProxyServer>)> {
+    async fn handle_connection(&self, conn: Connecting) -> Result<(uuid::Uuid, Arc<ProxyServer>)> {
         tracing::info!("Got a new connection from: {:?}", conn.remote_address());
         let conn = conn.await?;
         let allocation_id = uuid::Uuid::new_v4();
@@ -220,10 +219,7 @@ impl ProxyServer {
         }
     }
 
-    async fn handle_connection(
-        &self,
-        conn: Connecting,
-    ) -> anyhow::Result<(String, Arc<PlayerConnection>)> {
+    async fn handle_connection(&self, conn: Connecting) -> Result<(String, Arc<PlayerConnection>)> {
         tracing::info!(
             "Got a new player connection from: {:?}",
             conn.remote_address()
@@ -239,7 +235,8 @@ impl ProxyServer {
             .send_async(ServerMessage::PlayerConnected {
                 player_id: player_id.clone(),
             })
-            .await?;
+            .await
+            .map_err(anyhow::Error::from)?;
 
         // create player connection to handle player side actions
         let player_connection = Arc::new(
@@ -278,13 +275,13 @@ impl ProxyServer {
             .map(|p| p.get_connection())
     }
 
-    async fn handle_uni(&self, mut recv_stream: RecvStream) -> anyhow::Result<()> {
+    async fn handle_uni(&self, mut recv_stream: RecvStream) -> Result<()> {
         // hand decode the first message so then we can just copy the streams without decoding
         let message: StreamInfo = read_framed(&mut recv_stream, 1024).await?;
 
         // get player connection
         let Some(player_connection) = self.get_player_connection(&message.player_id) else {
-            return Err(anyhow!("Unknown player: {}", message.player_id));
+            return Err(anyhow!("Unknown player: {}", message.player_id))?;
         };
 
         // open a uni stream to the player and copy the recv stream there
@@ -294,17 +291,13 @@ impl ProxyServer {
         Ok(())
     }
 
-    async fn handle_bi(
-        &self,
-        send_stream: SendStream,
-        mut recv_stream: RecvStream,
-    ) -> anyhow::Result<()> {
+    async fn handle_bi(&self, send_stream: SendStream, mut recv_stream: RecvStream) -> Result<()> {
         // hand decode the first message so then we can just copy the streams without decoding
         let message: StreamInfo = read_framed(&mut recv_stream, 1024).await?;
 
         // get player connection
         let Some(player_connection) = self.get_player_connection(&message.player_id) else {
-            return Err(anyhow!("Unknown player: {}", message.player_id));
+            return Err(anyhow!("Unknown player: {}", message.player_id))?;
         };
 
         // open a bi stream to the player and copy the server streams there
@@ -315,10 +308,10 @@ impl ProxyServer {
         Ok(())
     }
 
-    async fn handle_datagram(&self, datagram: Bytes) -> anyhow::Result<()> {
+    async fn handle_datagram(&self, datagram: Bytes) -> Result<()> {
         let (DatagramInfo { player_id }, data) = drop_prefix(datagram)?;
         let Some(player_connection) = self.get_player_connection(&player_id) else {
-            return Err(anyhow!("Unknown player: {}", player_id));
+            return Err(anyhow!("Unknown player: {}", player_id))?;
         };
         player_connection.send_datagram(data)?;
         Ok(())
@@ -336,7 +329,7 @@ impl PlayerConnection {
         ambient_server_conn: Connection,
         player_id: String,
         conn: Connection,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self> {
         Ok(Self {
             ambient_server_conn,
             player_id,
@@ -381,7 +374,7 @@ impl PlayerConnection {
         }
     }
 
-    async fn handle_uni(&self, recv_stream: RecvStream) -> anyhow::Result<()> {
+    async fn handle_uni(&self, recv_stream: RecvStream) -> Result<()> {
         let mut send_stream = self.ambient_server_conn.open_uni().await?;
         write_framed(
             &mut send_stream,
@@ -394,11 +387,7 @@ impl PlayerConnection {
         Ok(())
     }
 
-    async fn handle_bi(
-        &self,
-        send_stream: SendStream,
-        recv_stream: RecvStream,
-    ) -> anyhow::Result<()> {
+    async fn handle_bi(&self, send_stream: SendStream, recv_stream: RecvStream) -> Result<()> {
         let (mut server_send_stream, server_recv_stream) =
             self.ambient_server_conn.open_bi().await?;
         write_framed(
@@ -413,7 +402,7 @@ impl PlayerConnection {
         Ok(())
     }
 
-    async fn handle_datagram(&self, datagram: Bytes) -> anyhow::Result<()> {
+    async fn handle_datagram(&self, datagram: Bytes) -> Result<()> {
         self.ambient_server_conn.send_datagram(prefix(
             &DatagramInfo {
                 player_id: self.player_id.clone(),

@@ -15,7 +15,7 @@ path = "src/sample_client.rs"
 name = "sample_client"
 
 [dependencies]
-anyhow = "1.0.70"
+anyhow = "1.0.70"   # TODO: remove?
 axum = "0.6.4"
 bincode = "1.3.3"
 bytes = "1.1.0"
@@ -26,6 +26,7 @@ quinn = "0.9"
 parking_lot = { version = "0.12", features = ["serde"] }
 rustls = { version = "0.20.6", features = ["dangerous_configuration", "quic"] }
 serde = { version = "1", features = ["derive"]}
+thiserror = "1.0"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"]}
 tokio-util = { version = "0.7", features = ["codec"] }
 tower = "0.4.13"

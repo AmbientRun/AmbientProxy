@@ -18,6 +18,7 @@ use tokio::{
 use crate::{
     protocol::{DatagramInfo, ServerMessage, StreamInfo},
     streams::{read_framed, write_framed, IncomingStream, OutgoingStream},
+    Result,
 };
 
 const CERT: &[u8] = include_bytes!("./cert.der");
@@ -65,7 +66,7 @@ pub struct Client {
 }
 
 impl Client {
-    pub async fn connect<T: ToSocketAddrs + Debug + Clone>(host: T) -> anyhow::Result<Self> {
+    pub async fn connect<T: ToSocketAddrs + Debug + Clone>(host: T) -> Result<Self> {
         let server_addr = lookup_host(host.clone())
             .await?
             .next()
@@ -87,13 +88,16 @@ impl Client {
         client_config.transport_config(Arc::new(transport));
         endpoint.set_default_client_config(client_config);
 
-        let conn = endpoint.connect(server_addr, "localhost")?.await?;
+        let conn = endpoint
+            .connect(server_addr, "localhost")
+            .map_err(anyhow::Error::from)?
+            .await?;
         let (send_stream, recv_stream) = conn.accept_bi().await?;
         let mut rx = IncomingStream::new(recv_stream);
         let tx = OutgoingStream::new(send_stream);
         let allocation: ServerMessage = rx.next().await?;
         let ServerMessage::Allocation { id: allocation_id, endpoint: proxy_endpoint } = allocation else {
-            return Err(anyhow::anyhow!("Unexpected proxy message: {:?}", allocation));
+            return Err(anyhow::anyhow!("Unexpected proxy message: {:?}", allocation))?;
         };
         println!("{:?} via {:?}", allocation_id, proxy_endpoint);
 
@@ -194,7 +198,7 @@ pub struct ProxiedConnection {
 }
 
 impl ProxiedConnection {
-    pub async fn open_uni(&self) -> anyhow::Result<SendStream> {
+    pub async fn open_uni(&self) -> Result<SendStream> {
         let mut send_stream = self.conn.open_uni().await?;
         write_framed(
             &mut send_stream,
@@ -206,7 +210,7 @@ impl ProxiedConnection {
         Ok(send_stream)
     }
 
-    pub async fn open_bi(&self) -> anyhow::Result<(SendStream, RecvStream)> {
+    pub async fn open_bi(&self) -> Result<(SendStream, RecvStream)> {
         let (mut send_stream, recv_stream) = self.conn.open_bi().await?;
         write_framed(
             &mut send_stream,
@@ -260,7 +264,7 @@ impl ProxiedConnection {
         }
     }
 
-    pub async fn send_datagram(&self, data: Bytes) -> anyhow::Result<()> {
+    pub async fn send_datagram(&self, data: Bytes) -> Result<()> {
         Ok(self.conn.send_datagram(crate::bytes::prefix(
             &DatagramInfo {
                 player_id: self.player_id.clone(),

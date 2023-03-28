@@ -38,6 +38,7 @@ dependencies = [
  "quinn",
  "rustls",
  "serde 1.0.158",
+ "thiserror",
  "tokio",
  "tokio-util",
  "tower",
