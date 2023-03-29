@@ -1,10 +1,9 @@
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 
 use ambient_proxy::{
-    server::{start_http_interface, ManagementServer},
+    server::ManagementServer,
     telemetry::{get_subscriber, init_subscriber},
 };
-use tokio::runtime::Handle;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -13,16 +12,12 @@ async fn main() -> anyhow::Result<()> {
     init_subscriber(subscriber);
 
     // start management server
-    let server = ManagementServer::new(SocketAddr::from(([0, 0, 0, 0], 7000)))?;
+    ManagementServer::new(
+        SocketAddr::from(([0, 0, 0, 0], 7000)),
+        SocketAddr::from(([0, 0, 0, 0], 8080)),
+    )?
+    .start()
+    .await;
 
-    // start http listener for asset downloading
-    // FIXME: move to a startup-alike mod and factor out addr to configuration
-    let http_addr = SocketAddr::from(([0, 0, 0, 0], 8080));
-    start_http_interface(Handle::current(), TcpListener::bind(http_addr)?);
-
-    tokio::spawn(async move {
-        server.start().await;
-    });
-
-    Ok(tokio::signal::ctrl_c().await?)
+    Ok(())
 }

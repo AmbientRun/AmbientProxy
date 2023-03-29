@@ -1,12 +1,19 @@
 use std::{
     collections::HashMap,
+    fmt::Debug,
     net::{IpAddr, SocketAddr, TcpListener},
     ops::Range,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::anyhow;
-use axum::{http::Method, routing::get, Router};
+use axum::{
+    extract::{Path, State},
+    http::{Method, StatusCode},
+    routing::get,
+    Router,
+};
 use bytes::Bytes;
 use flume::{Receiver, Sender};
 use futures::StreamExt;
@@ -15,26 +22,43 @@ use quinn::{
     Connecting, Connection, Endpoint, RecvStream, SendStream, ServerConfig, TransportConfig,
 };
 use rustls::{Certificate, PrivateKey};
-use tokio::{runtime::Handle, sync::Notify};
+use tokio::sync::Notify;
 use tower_http::cors::CorsLayer;
 
 use crate::{
     bytes::{drop_prefix, prefix},
     protocol::{ClientMessage, DatagramInfo, ServerMessage, StreamInfo},
     streams::{read_framed, spawn_stream_copy, write_framed, IncomingStream, OutgoingStream},
-    Result,
 };
+
+const ASSET_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 const CERT: &[u8] = include_bytes!("./cert.der");
 const CERT_KEY: &[u8] = include_bytes!("./cert.key.der");
 
-pub struct ManagementServer {
-    endpoint: Endpoint,
+#[derive(Default)]
+struct ProxyStore {
     proxies: RwLock<HashMap<uuid::Uuid, Arc<ProxyServer>>>,
 }
 
+impl ProxyStore {
+    fn insert(&self, id: uuid::Uuid, proxy: Arc<ProxyServer>) {
+        self.proxies.write().insert(id, proxy);
+    }
+
+    fn get(&self, id: &uuid::Uuid) -> Option<Arc<ProxyServer>> {
+        self.proxies.read().get(id).cloned()
+    }
+}
+
+pub struct ManagementServer {
+    endpoint: Endpoint,
+    http_listener: TcpListener,
+    proxies: Arc<ProxyStore>,
+}
+
 impl ManagementServer {
-    pub fn new(server_addr: SocketAddr) -> Result<Self> {
+    pub fn new(server_addr: SocketAddr, http_addr: SocketAddr) -> crate::Result<Self> {
         let cert = Certificate(CERT.to_vec());
         let cert_key = PrivateKey(CERT_KEY.to_vec());
         let mut server_conf =
@@ -45,15 +69,24 @@ impl ManagementServer {
         let endpoint = Endpoint::server(server_conf, server_addr)?;
         Ok(Self {
             endpoint,
+            http_listener: TcpListener::bind(http_addr)?,
             proxies: Default::default(),
         })
     }
 
-    pub async fn start(&self) {
-        while let Some(conn) = self.endpoint.accept().await {
-            match self.handle_connection(conn).await {
+    pub async fn start(self) {
+        let Self {
+            endpoint,
+            http_listener,
+            proxies,
+        } = self;
+
+        Self::start_http_interface(http_listener, proxies.clone());
+
+        while let Some(conn) = endpoint.accept().await {
+            match Self::handle_connection(conn).await {
                 Ok((id, proxy_server)) => {
-                    self.proxies.write().insert(id, proxy_server);
+                    proxies.insert(id, proxy_server);
                 }
                 Err(err) => {
                     tracing::error!("Failed handling the connection: {:?}", err);
@@ -62,7 +95,28 @@ impl ManagementServer {
         }
     }
 
-    async fn handle_connection(&self, conn: Connecting) -> Result<(uuid::Uuid, Arc<ProxyServer>)> {
+    fn start_http_interface(listener: TcpListener, proxies: Arc<ProxyStore>) {
+        let router = Router::new()
+            .route("/ping", get(|| async move { "ok" }))
+            .route("/content/:id/*path", get(get_asset))
+            .with_state(proxies)
+            .layer(
+                CorsLayer::new()
+                    .allow_origin(tower_http::cors::Any)
+                    .allow_methods(vec![Method::GET])
+                    .allow_headers(tower_http::cors::Any),
+            );
+
+        tokio::spawn(async move {
+            axum::Server::from_tcp(listener)
+                .unwrap()
+                .serve(router.into_make_service())
+                .await
+                .unwrap();
+        });
+    }
+
+    async fn handle_connection(conn: Connecting) -> crate::Result<(uuid::Uuid, Arc<ProxyServer>)> {
         tracing::info!("Got a new connection from: {:?}", conn.remote_address());
         let conn = conn.await?;
         let allocation_id = uuid::Uuid::new_v4();
@@ -264,7 +318,7 @@ impl ProxyServer {
             allocated_endpoint,
             external_endpoint,
             // FIXME
-            assets_root: format!("http://{}:8080/{}", self.public_addr, self.id),
+            assets_root: format!("http://{}:8080/content/{}/", self.public_addr, self.id),
         })
     }
 
@@ -277,7 +331,10 @@ impl ProxyServer {
         }
     }
 
-    async fn handle_connection(&self, conn: Connecting) -> Result<(String, Arc<PlayerConnection>)> {
+    async fn handle_connection(
+        &self,
+        conn: Connecting,
+    ) -> crate::Result<(String, Arc<PlayerConnection>)> {
         tracing::info!(
             "Got a new player connection from: {:?}",
             conn.remote_address()
@@ -333,7 +390,7 @@ impl ProxyServer {
             .map(|p| p.get_connection())
     }
 
-    async fn handle_uni(&self, mut recv_stream: RecvStream) -> Result<()> {
+    async fn handle_uni(&self, mut recv_stream: RecvStream) -> crate::Result<()> {
         // hand decode the first message so then we can just copy the streams without decoding
         let message: StreamInfo = read_framed(&mut recv_stream, 1024).await?;
 
@@ -349,7 +406,11 @@ impl ProxyServer {
         Ok(())
     }
 
-    async fn handle_bi(&self, send_stream: SendStream, mut recv_stream: RecvStream) -> Result<()> {
+    async fn handle_bi(
+        &self,
+        send_stream: SendStream,
+        mut recv_stream: RecvStream,
+    ) -> crate::Result<()> {
         // hand decode the first message so then we can just copy the streams without decoding
         let message: StreamInfo = read_framed(&mut recv_stream, 1024).await?;
 
@@ -366,13 +427,57 @@ impl ProxyServer {
         Ok(())
     }
 
-    async fn handle_datagram(&self, datagram: Bytes) -> Result<()> {
+    async fn handle_datagram(&self, datagram: Bytes) -> crate::Result<()> {
         let (DatagramInfo { player_id }, data) = drop_prefix(datagram)?;
         let Some(player_connection) = self.get_player_connection(&player_id) else {
             return Err(anyhow!("Unknown player: {}", player_id))?;
         };
         player_connection.send_datagram(data)?;
         Ok(())
+    }
+
+    async fn get_asset(
+        &self,
+        asset_id: String,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<Bytes>> {
+        let mut requested_from_server = false;
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        while tokio::time::Instant::now() < deadline {
+            let notify = {
+                // check if we already have the asset available
+                let mut map = self.asset_store.write();
+                let asset = map.entry(asset_id.clone()).or_default();
+                if let Some(asset_data) = asset.data.clone() {
+                    return Ok(Some(asset_data));
+                }
+
+                // request the asset from the server (if not already requested)
+                if !requested_from_server {
+                    requested_from_server = true;
+                    if self
+                        .server_message_sender
+                        .send(ServerMessage::RequestAsset {
+                            key: asset_id.clone(),
+                        })
+                        .is_err()
+                    {
+                        return Err(anyhow::anyhow!("Failed to request asset: {}", asset_id));
+                    };
+                }
+
+                // grab the notify so we can wait on it
+                asset.notify.clone()
+            };
+
+            // wait for the asset to be available (or timeout)
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {}
+                _ = notify.notified() => {}
+            }
+        }
+        Err(anyhow::anyhow!("Timed out getting asset: {}", asset_id))
     }
 }
 
@@ -387,7 +492,7 @@ impl PlayerConnection {
         ambient_server_conn: Connection,
         player_id: String,
         conn: Connection,
-    ) -> Result<Self> {
+    ) -> crate::Result<Self> {
         Ok(Self {
             ambient_server_conn,
             player_id,
@@ -432,7 +537,7 @@ impl PlayerConnection {
         }
     }
 
-    async fn handle_uni(&self, recv_stream: RecvStream) -> Result<()> {
+    async fn handle_uni(&self, recv_stream: RecvStream) -> crate::Result<()> {
         let mut send_stream = self.ambient_server_conn.open_uni().await?;
         write_framed(
             &mut send_stream,
@@ -445,7 +550,11 @@ impl PlayerConnection {
         Ok(())
     }
 
-    async fn handle_bi(&self, send_stream: SendStream, recv_stream: RecvStream) -> Result<()> {
+    async fn handle_bi(
+        &self,
+        send_stream: SendStream,
+        recv_stream: RecvStream,
+    ) -> crate::Result<()> {
         let (mut server_send_stream, server_recv_stream) =
             self.ambient_server_conn.open_bi().await?;
         write_framed(
@@ -460,7 +569,7 @@ impl PlayerConnection {
         Ok(())
     }
 
-    async fn handle_datagram(&self, datagram: Bytes) -> Result<()> {
+    async fn handle_datagram(&self, datagram: Bytes) -> crate::Result<()> {
         self.ambient_server_conn.send_datagram(prefix(
             &DatagramInfo {
                 player_id: self.player_id.clone(),
@@ -471,10 +580,12 @@ impl PlayerConnection {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Asset {
+    // FIXME: cache negative responses?
     data: Option<Bytes>,
     notify: Arc<Notify>,
+    // TODO: add timestamp and refresh periodically?
 }
 
 impl Asset {
@@ -484,22 +595,25 @@ impl Asset {
     }
 }
 
-pub fn start_http_interface(handle: Handle, listener: TcpListener) {
-    let router = Router::new()
-        .route("/ping", get(|| async move { "ok" }))
-        // .nest_service("/content", get_service(ServeDir::new(project_path.join("build"))).handle_error(handle_error))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(tower_http::cors::Any)
-                .allow_methods(vec![Method::GET])
-                .allow_headers(tower_http::cors::Any),
-        );
-
-    handle.spawn(async move {
-        axum::Server::from_tcp(listener)
-            .unwrap()
-            .serve(router.into_make_service())
-            .await
-            .unwrap();
-    });
+async fn get_asset(
+    Path((id, path)): Path<(String, String)>,
+    State(proxy_store): State<Arc<ProxyStore>>,
+) -> Result<Bytes, StatusCode> {
+    tracing::debug!("get_asset: {} {}", id, path);
+    let Ok(allocation_id) = uuid::Uuid::try_from(id.as_str()) else {
+        tracing::warn!("Invalid allocation id: {}", id);
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let Some(proxy_server) = proxy_store.get(&allocation_id) else {
+        tracing::warn!("Unknown allocation id: {}", id);
+        return Err(StatusCode::NOT_FOUND);
+    };
+    match proxy_server.get_asset(path, ASSET_FETCH_TIMEOUT).await {
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Ok(Some(data)) => Ok(data),
+        Err(err) => {
+            tracing::error!("Failed to get asset: {:?}", err);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }

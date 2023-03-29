@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fmt::Debug,
     net::SocketAddr,
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -61,10 +62,14 @@ pub struct Client {
     rx: IncomingStream,
     tx: OutgoingStream,
     pending: Arc<PendingResources>,
+    assets_path: PathBuf,
 }
 
 impl Client {
-    pub async fn connect<T: ToSocketAddrs + Debug + Clone>(proxy_server: T) -> Result<Self> {
+    pub async fn connect<T: ToSocketAddrs + Debug + Clone>(
+        proxy_server: T,
+        assets_path: PathBuf,
+    ) -> Result<Self> {
         let mut endpoint = Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
 
         let cert = Certificate(CERT.to_vec());
@@ -81,11 +86,12 @@ impl Client {
         client_config.transport_config(Arc::new(transport));
         endpoint.set_default_client_config(client_config);
 
-        Self::connect_using_endpoint(proxy_server, endpoint).await
+        Self::connect_using_endpoint(proxy_server, assets_path, endpoint).await
     }
 
     pub async fn connect_using_endpoint<T: ToSocketAddrs + Debug + Clone>(
         proxy_server: T,
+        assets_path: PathBuf,
         endpoint: Endpoint,
     ) -> Result<Self> {
         let server_addr = lookup_host(proxy_server.clone())
@@ -106,6 +112,7 @@ impl Client {
             rx,
             tx,
             pending: Default::default(),
+            assets_path: assets_path.canonicalize()?,
         })
     }
 
@@ -113,18 +120,23 @@ impl Client {
         self,
         on_endpoint_allocated: Arc<dyn Fn(AllocatedEndpoint) + Sync + Send>,
         on_player_connected: Arc<dyn Fn(String, ProxiedConnection) + Sync + Send>,
-        on_asset_requested: Arc<dyn Fn(String) + Sync + Send>,
     ) -> ClientController {
         let Client {
             conn,
             mut rx,
-            tx,
+            mut tx,
             pending,
+            assets_path,
         } = self;
-        let controller = ClientController { tx };
+        let (client_message_channel_tx, client_meesage_channel_rx) =
+            flume::unbounded::<ClientMessage>();
+        let controller = ClientController {
+            tx: client_message_channel_tx,
+        };
         tokio::spawn(async move {
             loop {
                 tokio::select! {
+                    // messages received from the proxy server
                     Ok(message) = rx.next::<ServerMessage>() => {
                         tracing::debug!("Got server message: {:?}", &message);
                         match message {
@@ -135,10 +147,34 @@ impl Client {
                                 on_player_connected(player_id.clone(), ProxiedConnection { player_id, conn: conn.clone(), pending: pending.clone() });
                             }
                             ServerMessage::RequestAsset { key } => {
-                                on_asset_requested(key);
+                                // load asset from disk
+                                let Ok(file_path) = assets_path.join(&key).canonicalize() else {
+                                    tracing::warn!("Failed to canonicalize asset path: {:?}", key);
+                                    continue;
+                                };
+                                if !file_path.starts_with(&assets_path) {
+                                    tracing::warn!("Asset path is outside of assets directory: {:?}", file_path);
+                                    continue;
+                                };
+                                let Ok(data) = tokio::fs::read(&file_path).await else {
+                                    tracing::warn!("Failed to open asset file: {:?}", file_path);
+                                    continue;
+                                };
+                                if let Err(err) = tx.send(&ClientMessage::StoreAsset { key, data }).await {
+                                    tracing::warn!("Failed to send asset: {:?}", err);
+                                }
                             }
                         }
                     }
+
+                    // resending messages from ClientController to the proxy server
+                    Ok(message) = client_meesage_channel_rx.recv_async() => {
+                        if let Err(err) = tx.send(&message).await {
+                            tracing::warn!("Failed to send client message: {:?}", err);
+                        }
+                    }
+
+                    // player's uni stream proxied from the proxy server
                     Ok(mut recv_stream) = conn.accept_uni() => {
                         let Ok(StreamInfo { player_id }) = read_framed(&mut recv_stream, 1024).await else {
                             tracing::warn!("Failed to read stream info");
@@ -146,6 +182,8 @@ impl Client {
                         };
                         pending.uni_streams.write().entry(player_id).or_default().push(recv_stream);
                     }
+
+                    // player's bi stream proxied from the proxy server
                     Ok((send_stream, mut recv_stream)) = conn.accept_bi() => {
                         let Ok(StreamInfo { player_id }) = read_framed(&mut recv_stream, 1024).await else {
                             tracing::warn!("Failed to read stream info");
@@ -153,6 +191,8 @@ impl Client {
                         };
                         pending.bi_streams.write().entry(player_id).or_default().push((send_stream, recv_stream));
                     }
+
+                    // player's datagram proxied from the proxy server
                     Ok(datagram) = conn.read_datagram() => {
                         tracing::debug!("Datagram received");
                         let Ok((DatagramInfo { player_id }, data)) = crate::bytes::drop_prefix(datagram) else {
@@ -198,19 +238,23 @@ impl TryFrom<ServerMessage> for AllocatedEndpoint {
 }
 
 pub struct ClientController {
-    tx: OutgoingStream,
+    tx: flume::Sender<ClientMessage>,
 }
 
 impl ClientController {
     pub async fn allocate_endpoint(&mut self) -> Result<()> {
-        self.tx.send(&ClientMessage::AllocateEndpoint).await?;
+        self.tx
+            .send_async(ClientMessage::AllocateEndpoint)
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to send allocate endpoint message"))?;
         Ok(())
     }
 
     pub async fn store_asset(&mut self, key: String, data: Vec<u8>) -> Result<()> {
         self.tx
-            .send(&ClientMessage::StoreAsset { key, data })
-            .await?;
+            .send_async(ClientMessage::StoreAsset { key, data })
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to send store asset message"))?;
         Ok(())
     }
 }
