@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fmt::Debug,
     net::{IpAddr, SocketAddr, TcpListener},
-    ops::Range,
+    ops::RangeInclusive,
     sync::Arc,
     time::Duration,
 };
@@ -21,6 +21,7 @@ use parking_lot::RwLock;
 use quinn::{
     Connecting, Connection, Endpoint, RecvStream, SendStream, ServerConfig, TransportConfig,
 };
+use rand::Rng;
 use rustls::{Certificate, PrivateKey};
 use tokio::sync::Notify;
 use tower_http::cors::CorsLayer;
@@ -52,13 +53,40 @@ impl ProxyStore {
 }
 
 pub struct ManagementServer {
+    /// Management server endpoint
     endpoint: Endpoint,
+
+    /// HTTP interface listener (ping, assets, etc.)
     http_listener: TcpListener,
+
+    /// Currently allocated proxies
     proxies: Arc<ProxyStore>,
+
+    /// Address to bind to
+    bind_addr: IpAddr,
+
+    /// Range of ports to allocate for proxies
+    proxy_allocation_ports: RangeInclusive<u16>,
+
+    /// Public address of the server (to advertise to clients)
+    public_host_name: String,
+
+    /// Public address of the HTTP interface, hostname:port (to advertise to clients)
+    http_public_addr: String,
 }
 
 impl ManagementServer {
-    pub fn new(server_addr: SocketAddr, http_addr: SocketAddr) -> crate::Result<Self> {
+    pub fn new(
+        bind_addr: IpAddr,
+        management_port: u16,
+        http_port: u16,
+        proxy_allocation_ports: RangeInclusive<u16>,
+        public_host_name: String,
+        http_public_host_name: String,
+    ) -> crate::Result<Self> {
+        let server_addr = SocketAddr::from((bind_addr, management_port));
+        let http_addr = SocketAddr::from((bind_addr, http_port));
+
         let cert = Certificate(CERT.to_vec());
         let cert_key = PrivateKey(CERT_KEY.to_vec());
         let mut server_conf =
@@ -66,11 +94,16 @@ impl ManagementServer {
         let mut transport = TransportConfig::default();
         transport.max_idle_timeout(None);
         server_conf.transport = Arc::new(transport);
+
         let endpoint = Endpoint::server(server_conf, server_addr)?;
         Ok(Self {
             endpoint,
             http_listener: TcpListener::bind(http_addr)?,
             proxies: Default::default(),
+            bind_addr,
+            proxy_allocation_ports,
+            public_host_name,
+            http_public_addr: format!("{http_public_host_name}:{http_port}"),
         })
     }
 
@@ -79,12 +112,24 @@ impl ManagementServer {
             endpoint,
             http_listener,
             proxies,
+            bind_addr,
+            proxy_allocation_ports,
+            public_host_name,
+            http_public_addr,
         } = self;
 
         Self::start_http_interface(http_listener, proxies.clone());
 
         while let Some(conn) = endpoint.accept().await {
-            match Self::handle_connection(conn).await {
+            match Self::handle_connection(
+                conn,
+                bind_addr,
+                proxy_allocation_ports.clone(),
+                public_host_name.clone(),
+                http_public_addr.clone(),
+            )
+            .await
+            {
                 Ok((id, proxy_server)) => {
                     proxies.insert(id, proxy_server);
                 }
@@ -96,6 +141,7 @@ impl ManagementServer {
     }
 
     fn start_http_interface(listener: TcpListener, proxies: Arc<ProxyStore>) {
+        tracing::debug!("Starting HTTP interface on: {:?}", listener.local_addr());
         let router = Router::new()
             .route("/ping", get(|| async move { "ok" }))
             .route("/content/:id/*path", get(get_asset))
@@ -116,18 +162,24 @@ impl ManagementServer {
         });
     }
 
-    async fn handle_connection(conn: Connecting) -> crate::Result<(uuid::Uuid, Arc<ProxyServer>)> {
+    async fn handle_connection(
+        conn: Connecting,
+        bind_addr: IpAddr,
+        ports: RangeInclusive<u16>,
+        public_host_name: String,
+        http_public_addr: String,
+    ) -> crate::Result<(uuid::Uuid, Arc<ProxyServer>)> {
         tracing::info!("Got a new connection from: {:?}", conn.remote_address());
         let conn = conn.await?;
         let allocation_id = uuid::Uuid::new_v4();
-        // FIXME: grab IP and ports from config
         let proxy_server = Arc::new(
             ProxyServer::new(
                 allocation_id,
                 conn,
-                IpAddr::from([0, 0, 0, 0]),
-                IpAddr::from([0, 0, 0, 0]),
-                9000..10000,
+                public_host_name,
+                http_public_addr,
+                bind_addr,
+                ports,
             )
             .await?,
         );
@@ -147,9 +199,10 @@ impl ManagementServer {
 struct ProxyServer {
     id: uuid::Uuid,
     proxy_endpoint: RwLock<Option<Endpoint>>,
-    public_addr: IpAddr,
+    public_host_name: String,
+    http_public_addr: String,
     bind_addr: IpAddr,
-    ports: Range<u16>,
+    ports: RangeInclusive<u16>,
     ambient_server_conn: Connection,
     server_message_sender: Sender<ServerMessage>,
     client_message_receiver: Receiver<ClientMessage>,
@@ -158,29 +211,35 @@ struct ProxyServer {
 }
 
 impl ProxyServer {
-    fn create_proxy_endpoint(addr: IpAddr, ports: Range<u16>) -> anyhow::Result<Endpoint> {
+    const RANDOM_BIND_ATTEMPTS: i32 = 10;
+
+    fn create_proxy_endpoint(addr: IpAddr, ports: RangeInclusive<u16>) -> anyhow::Result<Endpoint> {
         let cert = Certificate(CERT.to_vec());
         let cert_key = PrivateKey(CERT_KEY.to_vec());
         let mut server_conf = ServerConfig::with_single_cert(vec![cert], cert_key)?;
         let mut transport = TransportConfig::default();
         transport.max_idle_timeout(None);
         server_conf.transport = Arc::new(transport);
-        // FIXME: pick a few ports at random
-        for port in ports {
+
+        // try a few times to pick a random port
+        for _ in 0..Self::RANDOM_BIND_ATTEMPTS {
+            let port = rand::thread_rng().gen_range(ports.clone());
             let server_addr = SocketAddr::from((addr, port));
             if let Ok(endpoint) = Endpoint::server(server_conf.clone(), server_addr) {
                 return Ok(endpoint);
             }
         }
+
         Err(anyhow!("Failed to bind"))
     }
 
     async fn new(
         id: uuid::Uuid,
         ambient_server_conn: Connection,
-        public_addr: IpAddr,
+        public_host_name: String,
+        http_public_addr: String,
         bind_addr: IpAddr,
-        ports: Range<u16>,
+        ports: RangeInclusive<u16>,
     ) -> anyhow::Result<Self> {
         // create communication channels
         let (client_message_sender, client_message_receiver) = flume::unbounded::<ClientMessage>();
@@ -222,7 +281,8 @@ impl ProxyServer {
         Ok(Self {
             id,
             proxy_endpoint: Default::default(),
-            public_addr,
+            public_host_name,
+            http_public_addr,
             bind_addr,
             ports,
             ambient_server_conn,
@@ -311,14 +371,12 @@ impl ProxyServer {
         let Ok(local_addr) = endpoint.local_addr() else {
             return Err(anyhow::anyhow!("Failed to get local address"));
         };
-        let allocated_endpoint = SocketAddr::from((self.public_addr, local_addr.port()));
         let external_endpoint = self.ambient_server_conn.remote_address();
         Ok(ServerMessage::Allocation {
             id: self.id,
-            allocated_endpoint,
+            allocated_endpoint: format!("{}:{}", self.public_host_name, local_addr.port()),
             external_endpoint,
-            // FIXME
-            assets_root: format!("http://{}:8080/content/{}/", self.public_addr, self.id),
+            assets_root: format!("http://{}/content/{}/", self.http_public_addr, self.id),
         })
     }
 

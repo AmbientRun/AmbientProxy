@@ -8,7 +8,7 @@ pub enum ServerMessage {
         /// Id of this allocation
         id: uuid::Uuid,
         /// The endpoint that the players should use to connect to the server via proxy
-        allocated_endpoint: SocketAddr,
+        allocated_endpoint: String,
         /// HTTP root for assets downloading
         assets_root: String,
         /// The endpoint that the players could try to connect to the server directly

@@ -211,7 +211,7 @@ impl Client {
 #[derive(Debug, Clone)]
 pub struct AllocatedEndpoint {
     pub id: uuid::Uuid,
-    pub allocated_endpoint: SocketAddr,
+    pub allocated_endpoint: String,
     pub external_endpoint: SocketAddr,
     pub assets_root: String,
 }

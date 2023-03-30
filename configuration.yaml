@@ -1,0 +1,21 @@
+# Ambient Proxy configuration example
+# Here are the default values for each configuration option
+
+# The public address of the server (to advertise to the clients)
+# public_host_name: localhost
+
+# The address to bind to (IPv4 or IPv6)
+# bind_address: 127.0.0.1
+
+# The port to bind to for the management interface (used by game servers)
+# management_port: 7000
+
+# The port to bind to for the proxy interface (used by game clients)
+# proxy_port_first: 9000
+# proxy_port_last: 9999
+
+# The public address of the HTTP interface (for assets downloading)
+# http_public_host_name: localhost
+
+# The port to bind to for the HTTP interface (for assets downloading)
+# http_port: 7000
