@@ -1,6 +1,7 @@
 pub mod bytes;
 pub mod client;
 pub mod configuration;
+pub mod paths;
 pub mod protocol;
 pub mod server;
 pub mod streams;

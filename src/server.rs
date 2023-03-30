@@ -311,9 +311,9 @@ impl ProxyServer {
 
                 // server send a message to the proxy
                 Some(message) = client_message_receiver.next() => {
-                    tracing::debug!("Got a message from client: {:?}", message);
                     match message {
                         ClientMessage::AllocateEndpoint => {
+                            tracing::debug!("Got allocate endpoint message from client: {:?}", message);
                             match self.handle_allocate_message() {
                                 Ok(allocated_endpoint_message) => {
                                     if let Err(err) = self.server_message_sender.send_async(allocated_endpoint_message).await {
@@ -326,6 +326,7 @@ impl ProxyServer {
                             }
                         }
                         ClientMessage::StoreAsset { key, data } => {
+                            tracing::debug!("Got store asset message from client: {} {}b", key, data.len());
                             self.asset_store.write().entry(key).or_default().store(data);
                         }
                     }

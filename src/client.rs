@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fmt::Debug,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -17,6 +17,7 @@ use tokio::{
 };
 
 use crate::{
+    paths::{load_asset_data, path_to_key},
     protocol::{ClientMessage, DatagramInfo, ServerMessage, StreamInfo},
     streams::{read_framed, write_framed, IncomingStream, OutgoingStream},
     Result,
@@ -132,6 +133,7 @@ impl Client {
             flume::unbounded::<ClientMessage>();
         let controller = ClientController {
             tx: client_message_channel_tx,
+            assets_path: assets_path.clone(),
         };
         tokio::spawn(async move {
             loop {
@@ -148,18 +150,11 @@ impl Client {
                             }
                             ServerMessage::RequestAsset { key } => {
                                 // load asset from disk
-                                let Ok(file_path) = assets_path.join(&key).canonicalize() else {
-                                    tracing::warn!("Failed to canonicalize asset path: {:?}", key);
+                                let Ok(data) = load_asset_data(&assets_path, &key).await else {
+                                    tracing::warn!("Failed to open asset file: {:?}", &key);
                                     continue;
                                 };
-                                if !file_path.starts_with(&assets_path) {
-                                    tracing::warn!("Asset path is outside of assets directory: {:?}", file_path);
-                                    continue;
-                                };
-                                let Ok(data) = tokio::fs::read(&file_path).await else {
-                                    tracing::warn!("Failed to open asset file: {:?}", file_path);
-                                    continue;
-                                };
+
                                 if let Err(err) = tx.send(&ClientMessage::StoreAsset { key, data }).await {
                                     tracing::warn!("Failed to send asset: {:?}", err);
                                 }
@@ -239,6 +234,7 @@ impl TryFrom<ServerMessage> for AllocatedEndpoint {
 
 pub struct ClientController {
     tx: flume::Sender<ClientMessage>,
+    assets_path: PathBuf,
 }
 
 impl ClientController {
@@ -251,10 +247,57 @@ impl ClientController {
     }
 
     pub async fn store_asset(&mut self, key: String, data: Vec<u8>) -> Result<()> {
+        tracing::debug!("Storing asset: {:?}", &key);
         self.tx
             .send_async(ClientMessage::StoreAsset { key, data })
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send store asset message"))?;
+        Ok(())
+    }
+
+    pub async fn pre_cache_assets(&mut self, directory: impl AsRef<Path>) -> Result<()> {
+        // get the path to the directory and make sure it's inside the assets directory
+        let path = self.assets_path.join(directory).canonicalize()?;
+        if !path.starts_with(&self.assets_path) {
+            return Err(anyhow::anyhow!("Directory is outside of assets directory"))?;
+        };
+
+        // prepare the stack to dive deep into the directory
+        let mut path_stack = Vec::new();
+        path_stack.push(path);
+
+        while let Some(path) = path_stack.pop() {
+            let mut dir = tokio::fs::read_dir(path).await?;
+            while let Some(entry) = dir.next_entry().await? {
+                let entry_path = entry.path();
+                let Ok(file_type) = entry.file_type().await else {
+                    tracing::warn!("Failed to get file type: {:?}", &entry_path);
+                    continue;
+                };
+                if file_type.is_file() {
+                    // entry is a file -> store it
+                    let Ok(key_path) = entry_path.strip_prefix(&self.assets_path) else {
+                        tracing::warn!("Failed to strip prefix: {:?}", &entry_path);
+                        continue;
+                    };
+                    let Ok(key) = path_to_key(key_path) else {
+                        tracing::warn!("Failed to convert path to key: {:?}", &key_path);
+                        continue;
+                    };
+                    let Ok(data) = tokio::fs::read(&entry_path).await else {
+                        tracing::warn!("Failed to read asset file: {:?}", &entry_path);
+                        continue;
+                    };
+                    if let Err(err) = self.store_asset(key, data).await {
+                        tracing::warn!("Failed to store asset: {:?}", err);
+                    }
+                } else if file_type.is_dir() {
+                    // entry is a directory -> dive into it
+                    path_stack.push(entry_path);
+                }
+            }
+        }
+
         Ok(())
     }
 }
