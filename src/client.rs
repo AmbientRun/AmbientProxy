@@ -8,7 +8,8 @@ use std::{
 };
 
 use bytes::Bytes;
-use parking_lot::RwLock;
+use flume::Sender;
+use parking_lot::{Mutex, RwLock};
 use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, TransportConfig};
 use rustls::{Certificate, RootCertStore};
 use tokio::{
@@ -129,12 +130,18 @@ impl Client {
             pending,
             assets_path,
         } = self;
+
         let (client_message_channel_tx, client_meesage_channel_rx) =
             flume::unbounded::<ClientMessage>();
-        let controller = ClientController {
-            tx: client_message_channel_tx,
-            assets_path: assets_path.clone(),
-        };
+        let endpoint_allocated = Arc::new(RwLock::new(false));
+        let endpoint_allocated_notify = Arc::new(Notify::new());
+        let controller = ClientController::new(
+            client_message_channel_tx,
+            assets_path.clone(),
+            endpoint_allocated.clone(),
+            endpoint_allocated_notify.clone(),
+        );
+
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -143,6 +150,8 @@ impl Client {
                         tracing::debug!("Got server message: {:?}", &message);
                         match message {
                             ServerMessage::Allocation { .. } => {
+                                *endpoint_allocated.write() = true;
+                                endpoint_allocated_notify.notify_waiters();
                                 on_endpoint_allocated(message.try_into().expect("Already matched allocation message"));
                             }
                             ServerMessage::PlayerConnected { player_id } => {
@@ -235,38 +244,133 @@ impl TryFrom<ServerMessage> for AllocatedEndpoint {
 pub struct ClientController {
     tx: flume::Sender<ClientMessage>,
     assets_path: PathBuf,
+
+    endpoint_allocated: Arc<RwLock<bool>>,
+    endpoint_allocated_notify: Arc<Notify>,
+
+    pre_cache_assets_stack: Arc<Mutex<Vec<PathBuf>>>,
+    pre_caching_task_running: Arc<RwLock<bool>>,
+    allocation_requested: bool,
 }
 
 impl ClientController {
+    fn new(
+        tx: flume::Sender<ClientMessage>,
+        assets_path: PathBuf,
+        endpoint_allocated: Arc<RwLock<bool>>,
+        endpoint_allocated_notify: Arc<Notify>,
+    ) -> Self {
+        Self {
+            tx,
+            assets_path,
+            endpoint_allocated,
+            endpoint_allocated_notify,
+            pre_cache_assets_stack: Default::default(),
+            pre_caching_task_running: Default::default(),
+            allocation_requested: false,
+        }
+    }
+
     pub async fn allocate_endpoint(&mut self) -> Result<()> {
         self.tx
             .send_async(ClientMessage::AllocateEndpoint)
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send allocate endpoint message"))?;
+
+        self.allocation_requested = true;
+        if !self.pre_cache_assets_stack.lock().is_empty() {
+            // there are some assets to pre-cache -> start the pre-caching task
+            self.start_pre_caching_task_if_needed();
+        }
+
         Ok(())
     }
 
     pub async fn store_asset(&mut self, key: String, data: Vec<u8>) -> Result<()> {
         tracing::debug!("Storing asset: {:?}", &key);
-        self.tx
-            .send_async(ClientMessage::StoreAsset { key, data })
+        Self::send_store_asset_message(&self.tx, key, data).await
+    }
+
+    async fn send_store_asset_message(
+        tx: &Sender<ClientMessage>,
+        key: String,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        tx.send_async(ClientMessage::StoreAsset { key, data })
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send store asset message"))?;
         Ok(())
     }
 
-    pub async fn pre_cache_assets(&mut self, directory: impl AsRef<Path>) -> Result<()> {
+    pub fn pre_cache_assets(&mut self, directory: impl AsRef<Path>) -> Result<()> {
         // get the path to the directory and make sure it's inside the assets directory
         let path = self.assets_path.join(directory).canonicalize()?;
         if !path.starts_with(&self.assets_path) {
             return Err(anyhow::anyhow!("Directory is outside of assets directory"))?;
         };
 
-        // prepare the stack to dive deep into the directory
-        let mut path_stack = Vec::new();
-        path_stack.push(path);
+        // push the directory onto the stack for later processing
+        self.pre_cache_assets_stack.lock().push(path);
 
-        while let Some(path) = path_stack.pop() {
+        if self.allocation_requested {
+            // allocation has already been requested -> start the pre-caching task
+            self.start_pre_caching_task_if_needed();
+        }
+
+        Ok(())
+    }
+
+    fn start_pre_caching_task_if_needed(&self) {
+        // make sure we only start one task
+        let mut pre_caching_task_running = self.pre_caching_task_running.write();
+        if *pre_caching_task_running {
+            return;
+        }
+        *pre_caching_task_running = true;
+
+        let endpoint_allocated = self.endpoint_allocated.clone();
+        let endpoint_allocated_notify = self.endpoint_allocated_notify.clone();
+        let assets_path = self.assets_path.clone();
+        let pre_cache_assets_stack = self.pre_cache_assets_stack.clone();
+        let tx = self.tx.clone();
+        let pre_caching_task_running = self.pre_caching_task_running.clone();
+
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while tokio::time::Instant::now() < deadline {
+                let allocated = *endpoint_allocated.read();
+                if allocated {
+                    if let Err(err) =
+                        Self::drain_pre_cache_assets_stack(assets_path, pre_cache_assets_stack, tx)
+                            .await
+                    {
+                        tracing::warn!("Failed to pre-cache assets: {:?}", err);
+                    }
+                    break;
+                } else {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(deadline) => {
+                            tracing::warn!("Timed out waiting for proxy endpoint allocation - skipping asset pre-caching");
+                            break;
+                        }
+                        _ = endpoint_allocated_notify.notified() => {}
+                    }
+                }
+            }
+            *pre_caching_task_running.write() = false;
+        });
+    }
+
+    async fn drain_pre_cache_assets_stack(
+        assets_path: PathBuf,
+        pre_cache_assets_stack: Arc<Mutex<Vec<PathBuf>>>,
+        tx: Sender<ClientMessage>,
+    ) -> Result<()> {
+        while let Some(path) = {
+            // this block is needed to make sure the lock guard is dropped before the await
+            let path = pre_cache_assets_stack.lock().pop();
+            path
+        } {
             let mut dir = tokio::fs::read_dir(path).await?;
             while let Some(entry) = dir.next_entry().await? {
                 let entry_path = entry.path();
@@ -276,7 +380,7 @@ impl ClientController {
                 };
                 if file_type.is_file() {
                     // entry is a file -> store it
-                    let Ok(key_path) = entry_path.strip_prefix(&self.assets_path) else {
+                    let Ok(key_path) = entry_path.strip_prefix(&assets_path) else {
                         tracing::warn!("Failed to strip prefix: {:?}", &entry_path);
                         continue;
                     };
@@ -288,12 +392,12 @@ impl ClientController {
                         tracing::warn!("Failed to read asset file: {:?}", &entry_path);
                         continue;
                     };
-                    if let Err(err) = self.store_asset(key, data).await {
+                    if let Err(err) = Self::send_store_asset_message(&tx, key, data).await {
                         tracing::warn!("Failed to store asset: {:?}", err);
                     }
                 } else if file_type.is_dir() {
                     // entry is a directory -> dive into it
-                    path_stack.push(entry_path);
+                    pre_cache_assets_stack.lock().push(entry_path);
                 }
             }
         }
