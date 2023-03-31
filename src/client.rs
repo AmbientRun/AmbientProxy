@@ -8,7 +8,6 @@ use std::{
 };
 
 use bytes::Bytes;
-use flume::Sender;
 use parking_lot::{Mutex, RwLock};
 use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, TransportConfig};
 use rustls::{Certificate, RootCertStore};
@@ -292,7 +291,7 @@ impl ClientController {
     }
 
     async fn send_store_asset_message(
-        tx: &Sender<ClientMessage>,
+        tx: &flume::Sender<ClientMessage>,
         key: String,
         data: Vec<u8>,
     ) -> Result<()> {
@@ -364,7 +363,7 @@ impl ClientController {
     async fn drain_pre_cache_assets_stack(
         assets_path: PathBuf,
         pre_cache_assets_stack: Arc<Mutex<Vec<PathBuf>>>,
-        tx: Sender<ClientMessage>,
+        tx: flume::Sender<ClientMessage>,
     ) -> Result<()> {
         while let Some(path) = {
             // this block is needed to make sure the lock guard is dropped before the await
