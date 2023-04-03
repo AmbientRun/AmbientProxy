@@ -33,6 +33,7 @@ use crate::{
 };
 
 const ASSET_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 const CERT: &[u8] = include_bytes!("./cert.der");
 const CERT_KEY: &[u8] = include_bytes!("./cert.key.der");
@@ -92,7 +93,7 @@ impl ManagementServer {
         let mut server_conf =
             ServerConfig::with_single_cert(vec![cert], cert_key).map_err(anyhow::Error::from)?;
         let mut transport = TransportConfig::default();
-        transport.max_idle_timeout(None);
+        transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("Should fit in VarInt")));
         server_conf.transport = Arc::new(transport);
 
         let endpoint = Endpoint::server(server_conf, server_addr)?;
@@ -211,7 +212,7 @@ struct ProxyServer {
 }
 
 impl ProxyServer {
-    const RANDOM_BIND_ATTEMPTS: i32 = 10;
+    const BIND_ATTEMPTS: i32 = 10;
 
     fn create_proxy_endpoint(
         addr: IpAddr,
@@ -222,12 +223,12 @@ impl ProxyServer {
         let cert_key = PrivateKey(CERT_KEY.to_vec());
         let mut server_conf = ServerConfig::with_single_cert(vec![cert], cert_key)?;
         let mut transport = TransportConfig::default();
-        transport.max_idle_timeout(None);
+        transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("Should fit in VarInt")));
         server_conf.transport = Arc::new(transport);
 
         // pick a port
         let ports_len = *ports.end() - *ports.start() + 1;
-        for attempt in 0..Self::RANDOM_BIND_ATTEMPTS {
+        for attempt in 0..Self::BIND_ATTEMPTS {
             attempt.hash(&mut allocation_seed);
             let port = *ports.start() + (allocation_seed.finish() as u16) % ports_len;
             debug_assert!(ports.contains(&port));
@@ -360,8 +361,15 @@ impl ProxyServer {
                     }
                 }
 
+                err = self.ambient_server_conn.closed() => {
+                    tracing::info!("Server connection closed: {:?}", err);
+                    // TODO: dispose of ProxyServer
+                    break;
+                }
+
                 else => {
                     tracing::info!("Proxy server is shutting down");
+                    // TODO: dispose of ProxyServer
                     break;
                 }
             }
@@ -602,9 +610,16 @@ impl PlayerConnection {
                     }
                 }
 
+                err = self.conn.closed() => {
+                    tracing::info!("Player connection closed: {:?}", err);
+                    // TODO: remove player connection
+                    break;
+                }
+
                 // player connection closed
                 else => {
                     tracing::info!("Player connection closed");
+                    // TODO: remove player connection
                     break;
                 }
             }

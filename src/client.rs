@@ -24,6 +24,8 @@ use crate::{
 
 const CERT: &[u8] = include_bytes!("./cert.der");
 
+const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn default_client_endpoint() -> crate::Result<Endpoint> {
     let mut endpoint = Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
     let cert = Certificate(CERT.to_vec());
@@ -35,7 +37,7 @@ fn default_client_endpoint() -> crate::Result<Endpoint> {
         .with_no_client_auth();
     let mut transport = TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs_f32(1.)));
-    transport.max_idle_timeout(None);
+    transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("Should fit in VarInt")));
     let mut client_config = ClientConfig::new(Arc::new(crypto));
     client_config.transport_config(Arc::new(transport));
     endpoint.set_default_client_config(client_config);
