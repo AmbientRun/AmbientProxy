@@ -83,6 +83,7 @@ struct PendingResources {
 pub struct Builder {
     endpoint: Option<Endpoint>,
     proxy_server: Option<String>,
+    project_id: String,
     assets_path: Option<PathBuf>,
     user_agent: Option<String>,
 }
@@ -99,6 +100,11 @@ impl Builder {
 
     pub fn proxy_server(mut self, proxy_server: String) -> Self {
         self.proxy_server = Some(proxy_server);
+        self
+    }
+
+    pub fn project_id(mut self, project_id: String) -> Self {
+        self.project_id = project_id;
         self
     }
 
@@ -127,11 +133,8 @@ impl Builder {
         };
 
         if proxy_server.starts_with("http://") || proxy_server.starts_with("https://") {
-            static APP_USER_AGENT: &str = concat!(
-                env!("CARGO_PKG_NAME"),
-                "/",
-                env!("CARGO_PKG_VERSION"),
-            );
+            static APP_USER_AGENT: &str =
+                concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
 
             proxy_server = reqwest::ClientBuilder::new()
                 .user_agent(self.user_agent.unwrap_or(APP_USER_AGENT.to_string()))
@@ -150,7 +153,7 @@ impl Builder {
             }
         }
 
-        Ok(Client::connect(proxy_server, assets_path, endpoint).await?)
+        Ok(Client::connect(proxy_server, self.project_id, assets_path, endpoint).await?)
     }
 }
 
@@ -159,12 +162,14 @@ pub struct Client {
     rx: IncomingStream,
     tx: OutgoingStream,
     pending: Arc<PendingResources>,
+    project_id: String,
     assets_path: PathBuf,
 }
 
 impl Client {
     pub async fn connect<T: ToSocketAddrs + Debug + Clone>(
         proxy_server: T,
+        project_id: String,
         assets_path: PathBuf,
         endpoint: Endpoint,
     ) -> crate::Result<Self> {
@@ -186,6 +191,7 @@ impl Client {
             rx,
             tx,
             pending: Default::default(),
+            project_id,
             assets_path: assets_path.canonicalize()?,
         })
     }
@@ -200,6 +206,7 @@ impl Client {
             mut rx,
             mut tx,
             pending,
+            project_id,
             assets_path,
         } = self;
 
@@ -209,6 +216,7 @@ impl Client {
         let endpoint_allocated_notify = Arc::new(Notify::new());
         let controller = ClientController::new(
             client_message_channel_tx,
+            project_id,
             assets_path.clone(),
             endpoint_allocated.clone(),
             endpoint_allocated_notify.clone(),
@@ -315,6 +323,7 @@ impl TryFrom<ServerMessage> for AllocatedEndpoint {
 
 pub struct ClientController {
     tx: flume::Sender<ClientMessage>,
+    project_id: String,
     assets_path: PathBuf,
 
     endpoint_allocated: Arc<RwLock<bool>>,
@@ -328,12 +337,14 @@ pub struct ClientController {
 impl ClientController {
     fn new(
         tx: flume::Sender<ClientMessage>,
+        project_id: String,
         assets_path: PathBuf,
         endpoint_allocated: Arc<RwLock<bool>>,
         endpoint_allocated_notify: Arc<Notify>,
     ) -> Self {
         Self {
             tx,
+            project_id,
             assets_path,
             endpoint_allocated,
             endpoint_allocated_notify,
@@ -345,7 +356,9 @@ impl ClientController {
 
     pub async fn allocate_endpoint(&mut self) -> crate::Result<()> {
         self.tx
-            .send_async(ClientMessage::AllocateEndpoint)
+            .send_async(ClientMessage::AllocateEndpoint {
+                project_id: self.project_id.clone(),
+            })
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send allocate endpoint message"))?;
 

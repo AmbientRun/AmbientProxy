@@ -1,6 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{hash_map::DefaultHasher, HashMap},
     fmt::Debug,
+    hash::{Hash, Hasher},
     net::{IpAddr, SocketAddr, TcpListener},
     ops::RangeInclusive,
     sync::Arc,
@@ -21,7 +22,6 @@ use parking_lot::RwLock;
 use quinn::{
     Connecting, Connection, Endpoint, RecvStream, SendStream, ServerConfig, TransportConfig,
 };
-use rand::Rng;
 use rustls::{Certificate, PrivateKey};
 use tokio::sync::Notify;
 use tower_http::cors::CorsLayer;
@@ -213,7 +213,11 @@ struct ProxyServer {
 impl ProxyServer {
     const RANDOM_BIND_ATTEMPTS: i32 = 10;
 
-    fn create_proxy_endpoint(addr: IpAddr, ports: RangeInclusive<u16>) -> anyhow::Result<Endpoint> {
+    fn create_proxy_endpoint(
+        addr: IpAddr,
+        ports: RangeInclusive<u16>,
+        mut allocation_seed: impl Hasher,
+    ) -> anyhow::Result<Endpoint> {
         let cert = Certificate(CERT.to_vec());
         let cert_key = PrivateKey(CERT_KEY.to_vec());
         let mut server_conf = ServerConfig::with_single_cert(vec![cert], cert_key)?;
@@ -221,9 +225,12 @@ impl ProxyServer {
         transport.max_idle_timeout(None);
         server_conf.transport = Arc::new(transport);
 
-        // try a few times to pick a random port
-        for _ in 0..Self::RANDOM_BIND_ATTEMPTS {
-            let port = rand::thread_rng().gen_range(ports.clone());
+        // pick a port
+        let ports_len = *ports.end() - *ports.start() + 1;
+        for attempt in 0..Self::RANDOM_BIND_ATTEMPTS {
+            attempt.hash(&mut allocation_seed);
+            let port = *ports.start() + (allocation_seed.finish() as u16) % ports_len;
+            debug_assert!(ports.contains(&port));
             let server_addr = SocketAddr::from((addr, port));
             if let Ok(endpoint) = Endpoint::server(server_conf.clone(), server_addr) {
                 return Ok(endpoint);
@@ -312,9 +319,9 @@ impl ProxyServer {
                 // server send a message to the proxy
                 Some(message) = client_message_receiver.next() => {
                     match message {
-                        ClientMessage::AllocateEndpoint => {
+                        ClientMessage::AllocateEndpoint { ref project_id }=> {
                             tracing::debug!("Got allocate endpoint message from client: {:?}", message);
-                            match self.handle_allocate_message() {
+                            match self.handle_allocate_message(project_id) {
                                 Ok(allocated_endpoint_message) => {
                                     if let Err(err) = self.server_message_sender.send_async(allocated_endpoint_message).await {
                                         tracing::error!("Failed to send allocated endpoint message: {:?}", err);
@@ -361,18 +368,26 @@ impl ProxyServer {
         }
     }
 
-    fn handle_allocate_message(&self) -> anyhow::Result<ServerMessage> {
+    fn handle_allocate_message(
+        &self,
+        project_id: impl AsRef<str>,
+    ) -> anyhow::Result<ServerMessage> {
         if self.proxy_endpoint.read().is_some() {
             return Err(anyhow::anyhow!("Endpoint already allocated"));
         }
-        let Ok(endpoint) = Self::create_proxy_endpoint(self.bind_addr, self.ports.clone()) else {
+        let external_endpoint = self.ambient_server_conn.remote_address();
+
+        // base port selection on the ip and project id to favour reusing the same port
+        let mut hasher = DefaultHasher::new();
+        (external_endpoint.ip(), project_id.as_ref()).hash(&mut hasher);
+        let Ok(endpoint) = Self::create_proxy_endpoint(self.bind_addr, self.ports.clone(), hasher) else {
             return Err(anyhow::anyhow!("Failed to create proxy endpoint"));
         };
+
         *self.proxy_endpoint.write() = Some(endpoint.clone());
         let Ok(local_addr) = endpoint.local_addr() else {
             return Err(anyhow::anyhow!("Failed to get local address"));
         };
-        let external_endpoint = self.ambient_server_conn.remote_address();
         Ok(ServerMessage::Allocation {
             id: self.id,
             allocated_endpoint: format!("{}:{}", self.public_host_name, local_addr.port()),

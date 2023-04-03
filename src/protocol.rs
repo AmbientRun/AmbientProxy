@@ -24,7 +24,7 @@ pub enum ServerMessage {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ClientMessage {
-    AllocateEndpoint,
+    AllocateEndpoint { project_id: String },
     StoreAsset { key: String, data: Vec<u8> },
 }
 
