@@ -29,6 +29,7 @@ quinn = "0.9"
 parking_lot = { version = "0.12", features = ["serde"] }
 rand = "0.8.5"
 rustls = { version = "0.20.6", features = ["dangerous_configuration", "quic"] }
+reqwest = "0.11.16"
 serde = { version = "1", features = ["derive"]}
 thiserror = "1.0"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"]}
@@ -40,4 +41,3 @@ tracing-bunyan-formatter = "0.3"
 tracing-log = "0.1"
 tracing-subscriber = { version = "0.3", features = ["registry", "env-filter"] }
 uuid = { version = "1", features = ["serde", "v4"] }
-reqwest = "0.11.16"
