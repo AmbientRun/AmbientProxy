@@ -2,6 +2,13 @@
 name = "ambient_proxy"
 version = "0.1.0"
 edition = "2021"
+authors = ["Kuba Jaroszewski <jakub.jaroszewski@gmail.com>"]
+description = "NAT traversal proxy for Ambient game engine"
+repository = "https://github.com/Ambient/AmbientProxy"
+keywords = ["ambient", "game-development", "networking", "proxy", "nat-traversal"]
+categories = ["game-development"]
+readme = "README.md"
+license = "MIT OR Apache-2.0"
 
 [lib]
 path = "src/lib.rs"
