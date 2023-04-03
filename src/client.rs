@@ -20,10 +20,31 @@ use crate::{
     paths::{load_asset_data, path_to_key},
     protocol::{ClientMessage, DatagramInfo, ServerMessage, StreamInfo},
     streams::{read_framed, write_framed, IncomingStream, OutgoingStream},
-    Result,
 };
 
 const CERT: &[u8] = include_bytes!("./cert.der");
+
+fn default_client_endpoint() -> crate::Result<Endpoint> {
+    let mut endpoint = Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
+    let cert = Certificate(CERT.to_vec());
+    let mut roots = RootCertStore::empty();
+    roots.add(&cert).unwrap();
+    let crypto = rustls::ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let mut transport = TransportConfig::default();
+    transport.keep_alive_interval(Some(Duration::from_secs_f32(1.)));
+    transport.max_idle_timeout(None);
+    let mut client_config = ClientConfig::new(Arc::new(crypto));
+    client_config.transport_config(Arc::new(transport));
+    endpoint.set_default_client_config(client_config);
+    Ok(endpoint)
+}
+
+pub fn builder() -> Builder {
+    Builder::new()
+}
 
 #[derive(Debug)]
 struct QueuedResource<T> {
@@ -58,6 +79,81 @@ struct PendingResources {
     datagrams: RwLock<HashMap<String, QueuedResource<Bytes>>>,
 }
 
+#[derive(Debug, Default)]
+pub struct Builder {
+    endpoint: Option<Endpoint>,
+    proxy_server: Option<String>,
+    assets_path: Option<PathBuf>,
+    user_agent: Option<String>,
+}
+
+impl Builder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn endpoint(mut self, endpoint: Endpoint) -> Self {
+        self.endpoint = Some(endpoint);
+        self
+    }
+
+    pub fn proxy_server(mut self, proxy_server: String) -> Self {
+        self.proxy_server = Some(proxy_server);
+        self
+    }
+
+    pub fn assets_path<P: AsRef<Path>>(mut self, assets_path: P) -> Self {
+        self.assets_path = Some(assets_path.as_ref().to_path_buf());
+        self
+    }
+
+    pub fn user_agent(mut self, user_agent: String) -> Self {
+        self.user_agent = Some(user_agent);
+        self
+    }
+
+    pub async fn build(self) -> anyhow::Result<Client> {
+        let endpoint = match self.endpoint {
+            Some(endpoint) => endpoint,
+            None => default_client_endpoint()?,
+        };
+
+        let Some(assets_path) = self.assets_path else {
+            return Err(anyhow::anyhow!("assets_path is required"))?;
+        };
+
+        let Some(mut proxy_server) = self.proxy_server else {
+            return Err(anyhow::anyhow!("proxy_server is required"))?;
+        };
+
+        if proxy_server.starts_with("http://") || proxy_server.starts_with("https://") {
+            static APP_USER_AGENT: &str = concat!(
+                env!("CARGO_PKG_NAME"),
+                "/",
+                env!("CARGO_PKG_VERSION"),
+            );
+
+            proxy_server = reqwest::ClientBuilder::new()
+                .user_agent(self.user_agent.unwrap_or(APP_USER_AGENT.to_string()))
+                .build()?
+                .get(proxy_server)
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?
+                .trim()
+                .to_string();
+
+            if proxy_server.is_empty() {
+                return Err(anyhow::anyhow!("No proxy servers to use"))?;
+            }
+        }
+
+        Ok(Client::connect(proxy_server, assets_path, endpoint).await?)
+    }
+}
+
 pub struct Client {
     conn: Connection,
     rx: IncomingStream,
@@ -70,31 +166,8 @@ impl Client {
     pub async fn connect<T: ToSocketAddrs + Debug + Clone>(
         proxy_server: T,
         assets_path: PathBuf,
-    ) -> Result<Self> {
-        let mut endpoint = Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
-
-        let cert = Certificate(CERT.to_vec());
-        let mut roots = RootCertStore::empty();
-        roots.add(&cert).unwrap();
-        let crypto = rustls::ClientConfig::builder()
-            .with_safe_defaults()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let mut transport = TransportConfig::default();
-        transport.keep_alive_interval(Some(Duration::from_secs_f32(1.)));
-        transport.max_idle_timeout(None);
-        let mut client_config = ClientConfig::new(Arc::new(crypto));
-        client_config.transport_config(Arc::new(transport));
-        endpoint.set_default_client_config(client_config);
-
-        Self::connect_using_endpoint(proxy_server, assets_path, endpoint).await
-    }
-
-    pub async fn connect_using_endpoint<T: ToSocketAddrs + Debug + Clone>(
-        proxy_server: T,
-        assets_path: PathBuf,
         endpoint: Endpoint,
-    ) -> Result<Self> {
+    ) -> crate::Result<Self> {
         let server_addr = lookup_host(proxy_server.clone())
             .await?
             .next()
@@ -270,7 +343,7 @@ impl ClientController {
         }
     }
 
-    pub async fn allocate_endpoint(&mut self) -> Result<()> {
+    pub async fn allocate_endpoint(&mut self) -> crate::Result<()> {
         self.tx
             .send_async(ClientMessage::AllocateEndpoint)
             .await
@@ -285,7 +358,7 @@ impl ClientController {
         Ok(())
     }
 
-    pub async fn store_asset(&mut self, key: String, data: Vec<u8>) -> Result<()> {
+    pub async fn store_asset(&mut self, key: String, data: Vec<u8>) -> crate::Result<()> {
         tracing::debug!("Storing asset: {:?}", &key);
         Self::send_store_asset_message(&self.tx, key, data).await
     }
@@ -294,14 +367,14 @@ impl ClientController {
         tx: &flume::Sender<ClientMessage>,
         key: String,
         data: Vec<u8>,
-    ) -> Result<()> {
+    ) -> crate::Result<()> {
         tx.send_async(ClientMessage::StoreAsset { key, data })
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send store asset message"))?;
         Ok(())
     }
 
-    pub fn pre_cache_assets(&mut self, directory: impl AsRef<Path>) -> Result<()> {
+    pub fn pre_cache_assets(&mut self, directory: impl AsRef<Path>) -> crate::Result<()> {
         // get the path to the directory and make sure it's inside the assets directory
         let path = self.assets_path.join(directory).canonicalize()?;
         if !path.starts_with(&self.assets_path) {
@@ -364,7 +437,7 @@ impl ClientController {
         assets_path: PathBuf,
         pre_cache_assets_stack: Arc<Mutex<Vec<PathBuf>>>,
         tx: flume::Sender<ClientMessage>,
-    ) -> Result<()> {
+    ) -> crate::Result<()> {
         while let Some(path) = {
             // this block is needed to make sure the lock guard is dropped before the await
             let path = pre_cache_assets_stack.lock().pop();
@@ -413,7 +486,7 @@ pub struct ProxiedConnection {
 }
 
 impl ProxiedConnection {
-    pub async fn open_uni(&self) -> Result<SendStream> {
+    pub async fn open_uni(&self) -> crate::Result<SendStream> {
         let mut send_stream = self.conn.open_uni().await?;
         write_framed(
             &mut send_stream,
@@ -425,7 +498,7 @@ impl ProxiedConnection {
         Ok(send_stream)
     }
 
-    pub async fn open_bi(&self) -> Result<(SendStream, RecvStream)> {
+    pub async fn open_bi(&self) -> crate::Result<(SendStream, RecvStream)> {
         let (mut send_stream, recv_stream) = self.conn.open_bi().await?;
         write_framed(
             &mut send_stream,
@@ -479,7 +552,7 @@ impl ProxiedConnection {
         }
     }
 
-    pub async fn send_datagram(&self, data: Bytes) -> Result<()> {
+    pub async fn send_datagram(&self, data: Bytes) -> crate::Result<()> {
         Ok(self.conn.send_datagram(crate::bytes::prefix(
             &DatagramInfo {
                 player_id: self.player_id.clone(),

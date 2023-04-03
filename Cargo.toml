@@ -11,7 +11,7 @@ path = "src/main.rs"
 name = "ambient_proxy"
 
 [dependencies]
-anyhow = "1.0.70"   # TODO: remove?
+anyhow = "1.0.70"
 axum = "0.6.4"
 bincode = "1.3.3"
 bytes = "1.1.0"
@@ -33,3 +33,4 @@ tracing-bunyan-formatter = "0.3"
 tracing-log = "0.1"
 tracing-subscriber = { version = "0.3", features = ["registry", "env-filter"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+reqwest = "0.11.16"
