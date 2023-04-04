@@ -5,4 +5,4 @@ PUBLIC_IP=$(curl -H "Metadata-Flavor: Google" http://metadata/computeMetadata/v1
 export AMBIENT_PROXY_PUBLIC_HOST_NAME=$PUBLIC_IP
 export AMBIENT_PROXY_BIND_ADDRESS=0.0.0.0
 
-cargo run --release --bin ambient_proxy
+cargo run --features=server --release --bin ambient_proxy

@@ -1,10 +1,18 @@
 pub mod bytes;
 pub mod client;
+
+#[cfg(feature = "server")]
 pub mod configuration;
+
 pub mod paths;
 pub mod protocol;
+
+#[cfg(feature = "server")]
 pub mod server;
+
 pub mod streams;
+
+#[cfg(feature = "server")]
 pub mod telemetry;
 
 #[derive(Debug, thiserror::Error)]
