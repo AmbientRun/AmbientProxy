@@ -20,10 +20,10 @@ use flume::{Receiver, Sender};
 use futures::StreamExt;
 use parking_lot::RwLock;
 use quinn::{
-    Connecting, Connection, Endpoint, RecvStream, SendStream, ServerConfig, TransportConfig,
+    Connecting, Connection, Endpoint, RecvStream, SendStream, ServerConfig, TransportConfig, VarInt,
 };
 use rustls::{Certificate, PrivateKey};
-use tokio::sync::Notify;
+use tokio::{sync::Notify, task::JoinHandle};
 use tower_http::cors::CorsLayer;
 
 use crate::{
@@ -40,16 +40,25 @@ const CERT_KEY: &[u8] = include_bytes!("./cert.key.der");
 
 #[derive(Default)]
 struct ProxyStore {
-    proxies: RwLock<HashMap<uuid::Uuid, Arc<ProxyServer>>>,
+    proxies: RwLock<HashMap<uuid::Uuid, (JoinHandle<()>, Arc<ProxyServer>)>>,
 }
 
 impl ProxyStore {
-    fn insert(&self, id: uuid::Uuid, proxy: Arc<ProxyServer>) {
-        self.proxies.write().insert(id, proxy);
+    fn insert(&self, id: uuid::Uuid, proxy: Arc<ProxyServer>, handle: JoinHandle<()>) {
+        self.proxies.write().insert(id, (handle, proxy));
     }
 
-    fn get(&self, id: &uuid::Uuid) -> Option<Arc<ProxyServer>> {
-        self.proxies.read().get(id).cloned()
+    fn get_proxy(&self, id: &uuid::Uuid) -> Option<Arc<ProxyServer>> {
+        self.proxies.read().get(id).map(|(_, proxy)| proxy).cloned()
+    }
+
+    fn remove(&self, id: &uuid::Uuid) -> Option<Arc<ProxyServer>> {
+        if let Some((handle, proxy)) = self.proxies.write().remove(id) {
+            handle.abort();
+            Some(proxy)
+        } else {
+            None
+        }
     }
 }
 
@@ -121,21 +130,35 @@ impl ManagementServer {
 
         Self::start_http_interface(http_listener, proxies.clone());
 
-        while let Some(conn) = endpoint.accept().await {
-            match Self::handle_connection(
-                conn,
-                bind_addr,
-                proxy_allocation_ports.clone(),
-                public_host_name.clone(),
-                http_public_addr.clone(),
-            )
-            .await
-            {
-                Ok((id, proxy_server)) => {
-                    proxies.insert(id, proxy_server);
+        let (tx, rx) = flume::unbounded();
+
+        loop {
+            tokio::select! {
+                Some(conn) = endpoint.accept() => {
+                    match Self::handle_connection(
+                        conn,
+                        bind_addr,
+                        proxy_allocation_ports.clone(),
+                        public_host_name.clone(),
+                        http_public_addr.clone(),
+                        tx.clone(),
+                    )
+                    .await
+                    {
+                        Ok((id, handle, proxy_server)) => {
+                            proxies.insert(id, proxy_server, handle);
+                        }
+                        Err(err) => {
+                            tracing::error!("Failed handling the connection: {:?}", err);
+                        }
+                    }
                 }
-                Err(err) => {
-                    tracing::error!("Failed handling the connection: {:?}", err);
+                Ok(event) = rx.recv_async() => {
+                    match event {
+                        ProxyEvent::Stopped { id } => {
+                            proxies.remove(&id);
+                        }
+                    }
                 }
             }
         }
@@ -169,7 +192,8 @@ impl ManagementServer {
         ports: RangeInclusive<u16>,
         public_host_name: String,
         http_public_addr: String,
-    ) -> crate::Result<(uuid::Uuid, Arc<ProxyServer>)> {
+        event_tx: flume::Sender<ProxyEvent>,
+    ) -> crate::Result<(uuid::Uuid, JoinHandle<()>, Arc<ProxyServer>)> {
         tracing::info!("Got a new connection from: {:?}", conn.remote_address());
         let conn = conn.await?;
         let allocation_id = uuid::Uuid::new_v4();
@@ -181,20 +205,26 @@ impl ManagementServer {
                 http_public_addr,
                 bind_addr,
                 ports,
+                event_tx,
             )
             .await?,
         );
 
         // start the proxy server
-        {
+        let handle = {
             let proxy_server = proxy_server.clone();
             tokio::spawn(async move {
                 proxy_server.start().await;
-            });
-        }
+            })
+        };
 
-        Ok((allocation_id, proxy_server))
+        Ok((allocation_id, handle, proxy_server))
     }
+}
+
+#[derive(Clone, Debug)]
+enum ProxyEvent {
+    Stopped { id: uuid::Uuid },
 }
 
 struct ProxyServer {
@@ -204,10 +234,14 @@ struct ProxyServer {
     http_public_addr: String,
     bind_addr: IpAddr,
     ports: RangeInclusive<u16>,
+
     ambient_server_conn: Connection,
     server_message_sender: Sender<ServerMessage>,
     client_message_receiver: Receiver<ClientMessage>,
-    player_conns: RwLock<HashMap<String, Arc<PlayerConnection>>>,
+    messaging_processing_handle: JoinHandle<()>,
+    event_tx: flume::Sender<ProxyEvent>,
+
+    player_conns: RwLock<HashMap<String, (JoinHandle<()>, Arc<PlayerConnection>)>>,
     asset_store: RwLock<HashMap<String, Asset>>,
 }
 
@@ -248,12 +282,13 @@ impl ProxyServer {
         http_public_addr: String,
         bind_addr: IpAddr,
         ports: RangeInclusive<u16>,
+        event_tx: flume::Sender<ProxyEvent>,
     ) -> anyhow::Result<Self> {
         // create communication channels
         let (client_message_sender, client_message_receiver) = flume::unbounded::<ClientMessage>();
         let (server_message_sender, server_message_receiver) = flume::unbounded::<ServerMessage>();
 
-        {
+        let messaging_processing_handle = {
             let ambient_server_conn = ambient_server_conn.clone();
             tokio::spawn(async move {
                 // accept a bi stream from the newly connected server
@@ -281,10 +316,14 @@ impl ProxyServer {
                                 tracing::error!("Error sending message to the server: {:?}", err);
                             }
                         }
+                        err = ambient_server_conn.closed() => {
+                            tracing::info!("Server connection closed: {:?}", err);
+                            break;
+                        }
                     }
                 }
-            });
-        }
+            })
+        };
 
         Ok(Self {
             id,
@@ -296,6 +335,8 @@ impl ProxyServer {
             ambient_server_conn,
             server_message_sender,
             client_message_receiver,
+            messaging_processing_handle,
+            event_tx,
             player_conns: Default::default(),
             asset_store: Default::default(),
         })
@@ -303,13 +344,14 @@ impl ProxyServer {
 
     async fn start(&self) {
         let mut client_message_receiver = self.client_message_receiver.stream();
+        let (player_event_tx, player_event_rx) = flume::unbounded();
         loop {
             tokio::select! {
                 // new player connection
                 Some(conn) = self.accept_connection() => {
-                    match self.handle_connection(conn).await {
-                        Ok((player_id, connection)) => {
-                            self.player_conns.write().insert(player_id, connection);
+                    match self.handle_connection(conn, player_event_tx.clone()).await {
+                        Ok((player_id, handle, connection)) => {
+                            self.player_conns.write().insert(player_id, (handle, connection));
                         }
                         Err(err) => {
                             tracing::error!("Failed to handle incoming client connection: {:?}", err);
@@ -361,15 +403,30 @@ impl ProxyServer {
                     }
                 }
 
+                Ok(player_event) = player_event_rx.recv_async() => {
+                    match player_event {
+                        PlayerEvent::Disconnected { player_id } => {
+                            if let Some((handle, _)) = self.player_conns.write().remove(&player_id) {
+                                handle.abort();
+                            }
+                        }
+                    }
+                }
+
+                // ambient server connection closed
                 err = self.ambient_server_conn.closed() => {
                     tracing::info!("Server connection closed: {:?}", err);
-                    // TODO: dispose of ProxyServer
+                    if let Err(err) = self.event_tx.send_async(ProxyEvent::Stopped { id: self.id }).await {
+                        tracing::error!("Failed to send proxy stopped event: {:?}", err);
+                    }
                     break;
                 }
 
                 else => {
                     tracing::info!("Proxy server is shutting down");
-                    // TODO: dispose of ProxyServer
+                    if let Err(err) = self.event_tx.send_async(ProxyEvent::Stopped { id: self.id }).await {
+                        tracing::error!("Failed to send proxy stopped event: {:?}", err);
+                    }
                     break;
                 }
             }
@@ -416,7 +473,8 @@ impl ProxyServer {
     async fn handle_connection(
         &self,
         conn: Connecting,
-    ) -> crate::Result<(String, Arc<PlayerConnection>)> {
+        event_tx: flume::Sender<PlayerEvent>,
+    ) -> crate::Result<(String, JoinHandle<()>, Arc<PlayerConnection>)> {
         tracing::info!(
             "Got a new player connection from: {:?}",
             conn.remote_address()
@@ -437,8 +495,13 @@ impl ProxyServer {
 
         // create player connection to handle player side actions
         let player_connection = Arc::new(
-            PlayerConnection::new(self.ambient_server_conn.clone(), player_id.clone(), conn)
-                .await?,
+            PlayerConnection::new(
+                self.ambient_server_conn.clone(),
+                player_id.clone(),
+                conn,
+                event_tx,
+            )
+            .await?,
         );
 
         // open this bi stream to the server and send the player_id again
@@ -456,20 +519,20 @@ impl ProxyServer {
         spawn_stream_copy(server_recv_stream, send_stream);
 
         // start handling player connection
-        {
+        let handle = {
             let player_connection = player_connection.clone();
             tokio::spawn(async move {
                 player_connection.start().await;
-            });
-        }
-        Ok((player_id, player_connection))
+            })
+        };
+        Ok((player_id, handle, player_connection))
     }
 
     fn get_player_connection(&self, player_id: &str) -> Option<Connection> {
         self.player_conns
             .read()
             .get(player_id)
-            .map(|p| p.get_connection())
+            .map(|(_, p)| p.get_connection())
     }
 
     async fn handle_uni(&self, mut recv_stream: RecvStream) -> crate::Result<()> {
@@ -563,10 +626,30 @@ impl ProxyServer {
     }
 }
 
+impl Drop for ProxyServer {
+    fn drop(&mut self) {
+        tracing::info!("Shutting down proxy server: {}", self.id);
+
+        // abort the messaging processing task
+        self.messaging_processing_handle.abort();
+
+        // close the proxy endpoint
+        if let Some(proxy_endpoint) = self.proxy_endpoint.write().take() {
+            proxy_endpoint.close(VarInt::from_u32(0), b"");
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum PlayerEvent {
+    Disconnected { player_id: String },
+}
+
 struct PlayerConnection {
     ambient_server_conn: Connection,
     player_id: String,
     conn: Connection,
+    event_tx: flume::Sender<PlayerEvent>,
 }
 
 impl PlayerConnection {
@@ -574,11 +657,13 @@ impl PlayerConnection {
         ambient_server_conn: Connection,
         player_id: String,
         conn: Connection,
+        event_tx: flume::Sender<PlayerEvent>,
     ) -> crate::Result<Self> {
         Ok(Self {
             ambient_server_conn,
             player_id,
             conn,
+            event_tx,
         })
     }
 
@@ -610,16 +695,30 @@ impl PlayerConnection {
                     }
                 }
 
+                err = self.ambient_server_conn.closed() => {
+                    tracing::info!("Ambient server connection closed: {:?}", err);
+                    // no-op - ProxyServer will handle this
+                    break;
+                }
+
                 err = self.conn.closed() => {
                     tracing::info!("Player connection closed: {:?}", err);
-                    // TODO: remove player connection
+                    if let Err(err) = self.event_tx.send_async(PlayerEvent::Disconnected {
+                        player_id: self.player_id.clone(),
+                    }).await {
+                        tracing::error!("Failed to send player disconnected event: {:?}", err);
+                    }
                     break;
                 }
 
                 // player connection closed
                 else => {
                     tracing::info!("Player connection closed");
-                    // TODO: remove player connection
+                    if let Err(err) = self.event_tx.send_async(PlayerEvent::Disconnected {
+                        player_id: self.player_id.clone(),
+                    }).await {
+                        tracing::error!("Failed to send player disconnected event: {:?}", err);
+                    }
                     break;
                 }
             }
@@ -669,6 +768,15 @@ impl PlayerConnection {
     }
 }
 
+impl Drop for PlayerConnection {
+    fn drop(&mut self) {
+        tracing::info!("Shutting down player connection: {}", self.player_id);
+
+        // close the player connection
+        self.conn.close(VarInt::from_u32(0), b"");
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct Asset {
     // FIXME: cache negative responses?
@@ -693,7 +801,7 @@ async fn get_asset(
         tracing::warn!("Invalid allocation id: {}", id);
         return Err(StatusCode::BAD_REQUEST);
     };
-    let Some(proxy_server) = proxy_store.get(&allocation_id) else {
+    let Some(proxy_server) = proxy_store.get_proxy(&allocation_id) else {
         tracing::warn!("Unknown allocation id: {}", id);
         return Err(StatusCode::NOT_FOUND);
     };

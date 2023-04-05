@@ -77,10 +77,22 @@ pub async fn write_framed<T: Serialize>(send_stream: &mut SendStream, value: &T)
     Ok(())
 }
 
-pub fn spawn_stream_copy(mut recv_stream: RecvStream, mut send_stream: SendStream) {
+pub fn spawn_stream_copy(
+    mut recv_stream: RecvStream,
+    mut send_stream: SendStream,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(err) = copy(&mut recv_stream, &mut send_stream).await {
-            tracing::error!("Failed to copy streams: {:?}", err);
+            match err.kind() {
+                std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected => {
+                    tracing::debug!("Connection reset, aborted or not connected: {:?}", err);
+                }
+                _ => {
+                    tracing::error!("Failed to copy streams: {:?}", err);
+                }
+            }
         }
-    });
+    })
 }
