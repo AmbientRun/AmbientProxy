@@ -287,6 +287,17 @@ impl Client {
                         };
                         pending.datagrams.write().entry(player_id).or_default().push(data);
                     }
+
+                    // proxy server connection closed
+                    err = conn.closed() => {
+                        tracing::info!("Proxy connection closed: {:?}", err);
+                        break;
+                    }
+
+                    else => {
+                        tracing::info!("Proxy connection closed");
+                        break;
+                    }
                 }
             }
         });
