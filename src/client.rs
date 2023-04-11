@@ -54,9 +54,13 @@ async fn send_store_asset_message(
     let mut send_stream = conn.open_uni().await?;
     write_framed(
         &mut send_stream,
-        &ClientStreamHeader::StoreAsset { key, data },
+        &ClientStreamHeader::StoreAsset {
+            key,
+            length: data.len() as u32,
+        },
     )
     .await?;
+    send_stream.write_all(&data).await?;
     send_stream.finish().await?;
     Ok(())
 }

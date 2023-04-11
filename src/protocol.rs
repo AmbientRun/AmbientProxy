@@ -33,26 +33,13 @@ pub enum ClientMessage {
     AllocateEndpoint { project_id: String },
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ClientStreamHeader {
     /// Open a stream to selected player
     OpenPlayerStream { player_id: String },
 
     /// Store asset
-    StoreAsset { key: String, data: Vec<u8> },
-}
-
-impl std::fmt::Debug for ClientStreamHeader {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ClientStreamHeader::OpenPlayerStream { player_id } => {
-                write!(f, "OpenPlayerStream {{ player_id: {} }}", player_id)
-            }
-            ClientStreamHeader::StoreAsset { key, data } => {
-                write!(f, "StoreAsset {{ key: {}, data: {}b }}", key, data.len())
-            }
-        }
-    }
+    StoreAsset { key: String, length: u32 },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -36,6 +36,7 @@ use crate::{
 
 const ASSET_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const ASSET_SIZE_LIMIT: u32 = 128 * 1024 * 1024;
 
 const CERT: &[u8] = include_bytes!("./cert.der");
 const CERT_KEY: &[u8] = include_bytes!("./cert.key.der");
@@ -406,12 +407,9 @@ impl ProxyServer {
                 // server opening a new uni stream to a player
                 Ok(recv_stream) = self.ambient_server_conn.accept_uni() => {
                     // handling this might involve receiving assets (we don't want to block other processing)
-                    let weak_self = weak_self.clone();
-                    tokio::spawn(async move {
-                        if let Err(err) = Self::handle_uni(weak_self, recv_stream).await {
-                            tracing::error!("Failed to handle uni stream: {:?}", err);
-                        }
-                    });
+                    if let Err(err) = self.handle_uni(weak_self.clone(), recv_stream).await {
+                        tracing::error!("Failed to handle uni stream: {:?}", err);
+                    }
                 }
 
                 // server opening a new uni stream to a player
@@ -561,21 +559,21 @@ impl ProxyServer {
     }
 
     async fn handle_uni(
+        &self,
         proxy_server: Weak<ProxyServer>,
         mut recv_stream: RecvStream,
     ) -> crate::Result<()> {
         // hand decode the first message so then we can just copy the streams without decoding in case of proxied stream
-        let header: ClientStreamHeader = read_framed(&mut recv_stream, 128 * 1024 * 1024).await?;
-
-        // get the proxy server that is handling this uni stream
-        let proxy_server = proxy_server
-            .upgrade()
-            .ok_or_else(|| anyhow!("Proxy server is gone"))?;
+        let header: ClientStreamHeader = read_framed(&mut recv_stream, 1024).await?;
+        tracing::debug!(
+            "Got a new uni stream from the game server with header: {:?}",
+            header
+        );
 
         match header {
             ClientStreamHeader::OpenPlayerStream { player_id } => {
                 // get player connection
-                let Some(player_connection) = proxy_server.get_player_connection(&player_id) else {
+                let Some(player_connection) = self.get_player_connection(&player_id) else {
                     return Err(anyhow!("Unknown player: {}", player_id))?;
                 };
 
@@ -584,15 +582,38 @@ impl ProxyServer {
                 spawn_stream_copy(recv_stream, send_stream);
                 Ok(())
             }
-            ClientStreamHeader::StoreAsset { key, data } => {
+            ClientStreamHeader::StoreAsset { key, length } => {
                 // store the asset in the asset store
-                tracing::debug!("Storing asset: {} {}b", key, data.len());
-                proxy_server
-                    .asset_store
-                    .write()
-                    .entry(key)
-                    .or_default()
-                    .store(data);
+                tracing::debug!("Storing asset: {} {}b", key, length);
+
+                if length > ASSET_SIZE_LIMIT {
+                    return Err(anyhow!(
+                        "Asset too large: {} > {}",
+                        length,
+                        ASSET_SIZE_LIMIT
+                    ))?;
+                }
+
+                // read the asset data in a separate task
+                tokio::spawn(async move {
+                    let Ok(data) = recv_stream.read_to_end(length as usize).await else {
+                        tracing::warn!("Failed to read asset data");
+                        return;
+                    };
+
+                    // get the proxy server that is handling this uni stream
+                    let Some(proxy_server) = proxy_server.upgrade() else {
+                        tracing::debug!("Proxy server has been dropped");
+                        return;
+                    };
+
+                    proxy_server
+                        .asset_store
+                        .write()
+                        .entry(key)
+                        .or_default()
+                        .store(data);
+                });
                 Ok(())
             }
         }
