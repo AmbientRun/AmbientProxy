@@ -28,13 +28,13 @@ use tower_http::cors::CorsLayer;
 
 use crate::{
     bytes::{drop_prefix, prefix},
+    configuration::Settings,
     protocol::{
         ClientMessage, ClientStreamHeader, DatagramInfo, ServerMessage, ServerStreamHeader,
     },
     streams::{read_framed, spawn_stream_copy, write_framed, IncomingStream, OutgoingStream},
 };
 
-const ASSET_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const ASSET_SIZE_LIMIT: u32 = 128 * 1024 * 1024;
 
@@ -78,27 +78,17 @@ pub struct ManagementServer {
     /// Address to bind to
     bind_addr: IpAddr,
 
-    /// Range of ports to allocate for proxies
-    proxy_allocation_ports: RangeInclusive<u16>,
-
-    /// Public address of the server (to advertise to clients)
-    public_host_name: String,
-
     /// Public address of the HTTP interface, hostname:port (to advertise to clients)
     http_public_addr: String,
+
+    config: Settings,
 }
 
 impl ManagementServer {
-    pub fn new(
-        bind_addr: IpAddr,
-        management_port: u16,
-        http_port: u16,
-        proxy_allocation_ports: RangeInclusive<u16>,
-        public_host_name: String,
-        http_public_host_name: String,
-    ) -> crate::Result<Self> {
-        let server_addr = SocketAddr::from((bind_addr, management_port));
-        let http_addr = SocketAddr::from((bind_addr, http_port));
+    pub fn new(config: Settings) -> crate::Result<Self> {
+        let bind_addr = config.get_bind_addr();
+        let server_addr = SocketAddr::from((bind_addr, config.management_port));
+        let http_addr = SocketAddr::from((bind_addr, config.get_http_port()));
 
         let cert = Certificate(CERT.to_vec());
         let cert_key = PrivateKey(CERT_KEY.to_vec());
@@ -109,14 +99,15 @@ impl ManagementServer {
         server_conf.transport = Arc::new(transport);
 
         let endpoint = Endpoint::server(server_conf, server_addr)?;
+        let http_public_host_name = config.get_http_public_host_name();
+        let http_port = config.get_http_port();
         Ok(Self {
             endpoint,
             http_listener: TcpListener::bind(http_addr)?,
             proxies: Default::default(),
             bind_addr,
-            proxy_allocation_ports,
-            public_host_name,
             http_public_addr: format!("{http_public_host_name}:{http_port}"),
+            config,
         })
     }
 
@@ -126,12 +117,11 @@ impl ManagementServer {
             http_listener,
             proxies,
             bind_addr,
-            proxy_allocation_ports,
-            public_host_name,
             http_public_addr,
+            config,
         } = self;
 
-        Self::start_http_interface(http_listener, proxies.clone());
+        Self::start_http_interface(http_listener, proxies.clone(), config.clone());
 
         let (tx, rx) = flume::unbounded();
 
@@ -141,8 +131,8 @@ impl ManagementServer {
                     match Self::handle_connection(
                         conn,
                         bind_addr,
-                        proxy_allocation_ports.clone(),
-                        public_host_name.clone(),
+                        config.proxy_port_range(),
+                        config.public_host_name.clone(),
                         http_public_addr.clone(),
                         tx.clone(),
                     )
@@ -167,12 +157,12 @@ impl ManagementServer {
         }
     }
 
-    fn start_http_interface(listener: TcpListener, proxies: Arc<ProxyStore>) {
+    fn start_http_interface(listener: TcpListener, proxies: Arc<ProxyStore>, config: Settings) {
         tracing::debug!("Starting HTTP interface on: {:?}", listener.local_addr());
         let router = Router::new()
             .route("/ping", get(|| async move { "ok" }))
             .route("/content/:id/*path", get(get_asset))
-            .with_state(proxies)
+            .with_state((proxies, config))
             .layer(
                 CorsLayer::new()
                     .allow_origin(tower_http::cors::Any)
@@ -864,7 +854,7 @@ impl Asset {
 
 async fn get_asset(
     Path((id, path)): Path<(String, String)>,
-    State(proxy_store): State<Arc<ProxyStore>>,
+    State((proxy_store, config)): State<(Arc<ProxyStore>, Settings)>,
 ) -> Result<Bytes, StatusCode> {
     tracing::debug!("get_asset: {} {}", id, path);
     let Ok(allocation_id) = uuid::Uuid::try_from(id.as_str()) else {
@@ -875,7 +865,10 @@ async fn get_asset(
         tracing::warn!("Unknown allocation id: {}", id);
         return Err(StatusCode::NOT_FOUND);
     };
-    match proxy_server.get_asset(path, ASSET_FETCH_TIMEOUT).await {
+    match proxy_server
+        .get_asset(path, config.get_assets_download_timeout())
+        .await
+    {
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Ok(Some(data)) => Ok(data),
         Err(err) => {

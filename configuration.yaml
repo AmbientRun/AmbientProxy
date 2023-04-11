@@ -19,3 +19,6 @@
 
 # The port to bind to for the HTTP interface (for assets downloading)
 # http_port: 7000
+
+# The timeout for assets downloading (in seconds)
+# assets_download_timeout: 60
