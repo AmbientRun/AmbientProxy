@@ -4,7 +4,7 @@ use std::{
     hash::{Hash, Hasher},
     net::{IpAddr, SocketAddr, TcpListener},
     ops::RangeInclusive,
-    sync::Arc,
+    sync::{Arc, Weak},
     time::Duration,
 };
 
@@ -215,8 +215,9 @@ impl ManagementServer {
         // start the proxy server
         let handle = {
             let proxy_server = proxy_server.clone();
+            let weak_proxy_server = Arc::downgrade(&proxy_server);
             tokio::spawn(async move {
-                proxy_server.start().await;
+                proxy_server.start(weak_proxy_server).await;
             })
         };
 
@@ -356,7 +357,7 @@ impl ProxyServer {
         })
     }
 
-    async fn start(&self) {
+    async fn start(&self, weak_self: Weak<Self>) {
         let mut client_message_receiver = self.client_message_receiver.stream();
         let (player_event_tx, player_event_rx) = flume::unbounded();
 
@@ -404,9 +405,13 @@ impl ProxyServer {
 
                 // server opening a new uni stream to a player
                 Ok(recv_stream) = self.ambient_server_conn.accept_uni() => {
-                    if let Err(err) = self.handle_uni(recv_stream).await {
-                        tracing::error!("Failed to handle uni stream: {:?}", err);
-                    }
+                    // handling this might involve receiving assets (we don't want to block other processing)
+                    let weak_self = weak_self.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = Self::handle_uni(weak_self, recv_stream).await {
+                            tracing::error!("Failed to handle uni stream: {:?}", err);
+                        }
+                    });
                 }
 
                 // server opening a new uni stream to a player
@@ -555,14 +560,22 @@ impl ProxyServer {
             .map(|(_, p)| p.get_connection())
     }
 
-    async fn handle_uni(&self, mut recv_stream: RecvStream) -> crate::Result<()> {
+    async fn handle_uni(
+        proxy_server: Weak<ProxyServer>,
+        mut recv_stream: RecvStream,
+    ) -> crate::Result<()> {
         // hand decode the first message so then we can just copy the streams without decoding in case of proxied stream
         let header: ClientStreamHeader = read_framed(&mut recv_stream, 128 * 1024 * 1024).await?;
+
+        // get the proxy server that is handling this uni stream
+        let proxy_server = proxy_server
+            .upgrade()
+            .ok_or_else(|| anyhow!("Proxy server is gone"))?;
 
         match header {
             ClientStreamHeader::OpenPlayerStream { player_id } => {
                 // get player connection
-                let Some(player_connection) = self.get_player_connection(&player_id) else {
+                let Some(player_connection) = proxy_server.get_player_connection(&player_id) else {
                     return Err(anyhow!("Unknown player: {}", player_id))?;
                 };
 
@@ -574,7 +587,12 @@ impl ProxyServer {
             ClientStreamHeader::StoreAsset { key, data } => {
                 // store the asset in the asset store
                 tracing::debug!("Storing asset: {} {}b", key, data.len());
-                self.asset_store.write().entry(key).or_default().store(data);
+                proxy_server
+                    .asset_store
+                    .write()
+                    .entry(key)
+                    .or_default()
+                    .store(data);
                 Ok(())
             }
         }
