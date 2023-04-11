@@ -1,5 +1,3 @@
-use std::net::IpAddr;
-
 use ambient_proxy::{
     configuration::get_configuration,
     server::ManagementServer,
