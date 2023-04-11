@@ -34,7 +34,7 @@ use crate::{
     streams::{read_framed, spawn_stream_copy, write_framed, IncomingStream, OutgoingStream},
 };
 
-const ASSET_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+const ASSET_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const ASSET_SIZE_LIMIT: u32 = 128 * 1024 * 1024;
 
