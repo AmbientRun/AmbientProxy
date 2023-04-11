@@ -259,13 +259,22 @@ impl Client {
                             }
                             ServerMessage::RequestAsset { key } => {
                                 // load asset from disk
+                                tracing::trace!("Loading asset: {:?}", &key);
                                 let Ok(data) = load_asset_data(&assets_path, &key).await else {
                                     tracing::warn!("Failed to open asset file: {:?}", &key);
                                     continue;
                                 };
 
-                                if let Err(err) = send_store_asset_message(&conn, key, data).await {
-                                    tracing::warn!("Failed to send asset: {:?}", err);
+                                {
+                                    let conn = conn.clone();
+                                    tokio::spawn(async move {
+                                        tracing::trace!("Sending asset: {:?}", &key);
+                                        if let Err(err) = send_store_asset_message(&conn, key.clone(), data).await {
+                                            tracing::warn!("Failed to send asset: {:?}", err);
+                                        } else {
+                                            tracing::debug!("Sent asset: {:?}", &key)
+                                        }
+                                    });
                                 }
                             }
                         }
@@ -298,7 +307,6 @@ impl Client {
 
                     // player's datagram proxied from the proxy server
                     Ok(datagram) = conn.read_datagram() => {
-                        tracing::debug!("Datagram received");
                         let Ok((DatagramInfo { player_id }, data)) = crate::bytes::drop_prefix(datagram) else {
                             tracing::warn!("Failed to read datagram info");
                             continue;
