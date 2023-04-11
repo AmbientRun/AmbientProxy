@@ -18,7 +18,9 @@ use tokio::{
 
 use crate::{
     paths::{load_asset_data, path_to_key},
-    protocol::{ClientMessage, DatagramInfo, ServerMessage, StreamInfo},
+    protocol::{
+        ClientMessage, ClientStreamHeader, DatagramInfo, ServerMessage, ServerStreamHeader,
+    },
     streams::{read_framed, write_framed, IncomingStream, OutgoingStream},
 };
 
@@ -42,6 +44,21 @@ fn default_client_endpoint() -> crate::Result<Endpoint> {
     client_config.transport_config(Arc::new(transport));
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
+}
+
+async fn send_store_asset_message(
+    conn: &Connection,
+    key: String,
+    data: Vec<u8>,
+) -> crate::Result<()> {
+    let mut send_stream = conn.open_uni().await?;
+    write_framed(
+        &mut send_stream,
+        &ClientStreamHeader::StoreAsset { key, data },
+    )
+    .await?;
+    send_stream.finish().await?;
+    Ok(())
 }
 
 pub fn builder() -> Builder {
@@ -217,6 +234,7 @@ impl Client {
         let endpoint_allocated = Arc::new(RwLock::new(false));
         let endpoint_allocated_notify = Arc::new(Notify::new());
         let controller = ClientController::new(
+            conn.clone(),
             client_message_channel_tx,
             project_id,
             assets_path.clone(),
@@ -246,7 +264,7 @@ impl Client {
                                     continue;
                                 };
 
-                                if let Err(err) = tx.send(&ClientMessage::StoreAsset { key, data }).await {
+                                if let Err(err) = send_store_asset_message(&conn, key, data).await {
                                     tracing::warn!("Failed to send asset: {:?}", err);
                                 }
                             }
@@ -262,7 +280,7 @@ impl Client {
 
                     // player's uni stream proxied from the proxy server
                     Ok(mut recv_stream) = conn.accept_uni() => {
-                        let Ok(StreamInfo { player_id }) = read_framed(&mut recv_stream, 1024).await else {
+                        let Ok(ServerStreamHeader::PlayerStreamOpened { player_id }) = read_framed(&mut recv_stream, 1024).await else {
                             tracing::warn!("Failed to read stream info");
                             continue;
                         };
@@ -271,7 +289,7 @@ impl Client {
 
                     // player's bi stream proxied from the proxy server
                     Ok((send_stream, mut recv_stream)) = conn.accept_bi() => {
-                        let Ok(StreamInfo { player_id }) = read_framed(&mut recv_stream, 1024).await else {
+                        let Ok(ServerStreamHeader::PlayerStreamOpened { player_id }) = read_framed(&mut recv_stream, 1024).await else {
                             tracing::warn!("Failed to read stream info");
                             continue;
                         };
@@ -335,6 +353,7 @@ impl TryFrom<ServerMessage> for AllocatedEndpoint {
 }
 
 pub struct ClientController {
+    proxy_connection: Connection,
     tx: flume::Sender<ClientMessage>,
     project_id: String,
     assets_path: PathBuf,
@@ -349,6 +368,7 @@ pub struct ClientController {
 
 impl ClientController {
     fn new(
+        proxy_connection: Connection,
         tx: flume::Sender<ClientMessage>,
         project_id: String,
         assets_path: PathBuf,
@@ -356,6 +376,7 @@ impl ClientController {
         endpoint_allocated_notify: Arc<Notify>,
     ) -> Self {
         Self {
+            proxy_connection,
             tx,
             project_id,
             assets_path,
@@ -386,18 +407,7 @@ impl ClientController {
 
     pub async fn store_asset(&mut self, key: String, data: Vec<u8>) -> crate::Result<()> {
         tracing::debug!("Storing asset: {:?}", &key);
-        Self::send_store_asset_message(&self.tx, key, data).await
-    }
-
-    async fn send_store_asset_message(
-        tx: &flume::Sender<ClientMessage>,
-        key: String,
-        data: Vec<u8>,
-    ) -> crate::Result<()> {
-        tx.send_async(ClientMessage::StoreAsset { key, data })
-            .await
-            .map_err(|_| anyhow::anyhow!("Failed to send store asset message"))?;
-        Ok(())
+        send_store_asset_message(&self.proxy_connection, key, data).await
     }
 
     pub fn pre_cache_assets(&mut self, directory: impl AsRef<Path>) -> crate::Result<()> {
@@ -430,7 +440,7 @@ impl ClientController {
         let endpoint_allocated_notify = self.endpoint_allocated_notify.clone();
         let assets_path = self.assets_path.clone();
         let pre_cache_assets_stack = self.pre_cache_assets_stack.clone();
-        let tx = self.tx.clone();
+        let conn = self.proxy_connection.clone();
         let pre_caching_task_running = self.pre_caching_task_running.clone();
 
         tokio::spawn(async move {
@@ -438,9 +448,12 @@ impl ClientController {
             while tokio::time::Instant::now() < deadline {
                 let allocated = *endpoint_allocated.read();
                 if allocated {
-                    if let Err(err) =
-                        Self::drain_pre_cache_assets_stack(assets_path, pre_cache_assets_stack, tx)
-                            .await
+                    if let Err(err) = Self::drain_pre_cache_assets_stack(
+                        assets_path,
+                        pre_cache_assets_stack,
+                        conn,
+                    )
+                    .await
                     {
                         tracing::warn!("Failed to pre-cache assets: {:?}", err);
                     }
@@ -462,7 +475,7 @@ impl ClientController {
     async fn drain_pre_cache_assets_stack(
         assets_path: PathBuf,
         pre_cache_assets_stack: Arc<Mutex<Vec<PathBuf>>>,
-        tx: flume::Sender<ClientMessage>,
+        conn: Connection,
     ) -> crate::Result<()> {
         while let Some(path) = {
             // this block is needed to make sure the lock guard is dropped before the await
@@ -490,7 +503,7 @@ impl ClientController {
                         tracing::warn!("Failed to read asset file: {:?}", &entry_path);
                         continue;
                     };
-                    if let Err(err) = Self::send_store_asset_message(&tx, key, data).await {
+                    if let Err(err) = send_store_asset_message(&conn, key, data).await {
                         tracing::warn!("Failed to store asset: {:?}", err);
                     }
                 } else if file_type.is_dir() {
@@ -516,7 +529,7 @@ impl ProxiedConnection {
         let mut send_stream = self.conn.open_uni().await?;
         write_framed(
             &mut send_stream,
-            &StreamInfo {
+            &ClientStreamHeader::OpenPlayerStream {
                 player_id: self.player_id.clone(),
             },
         )
@@ -528,7 +541,7 @@ impl ProxiedConnection {
         let (mut send_stream, recv_stream) = self.conn.open_bi().await?;
         write_framed(
             &mut send_stream,
-            &StreamInfo {
+            &ClientStreamHeader::OpenPlayerStream {
                 player_id: self.player_id.clone(),
             },
         )

@@ -28,7 +28,9 @@ use tower_http::cors::CorsLayer;
 
 use crate::{
     bytes::{drop_prefix, prefix},
-    protocol::{ClientMessage, DatagramInfo, ServerMessage, StreamInfo},
+    protocol::{
+        ClientMessage, ClientStreamHeader, DatagramInfo, ServerMessage, ServerStreamHeader,
+    },
     streams::{read_framed, spawn_stream_copy, write_framed, IncomingStream, OutgoingStream},
 };
 
@@ -238,7 +240,9 @@ struct ProxyServer {
     ambient_server_conn: Connection,
     server_message_sender: Sender<ServerMessage>,
     client_message_receiver: Receiver<ClientMessage>,
-    messaging_processing_handle: JoinHandle<()>,
+    message_processing_handle: JoinHandle<()>,
+    message_processing_started: Arc<RwLock<bool>>,
+    message_processing_started_notify: Arc<Notify>,
     event_tx: flume::Sender<ProxyEvent>,
 
     player_conns: RwLock<HashMap<String, (JoinHandle<()>, Arc<PlayerConnection>)>>,
@@ -288,8 +292,14 @@ impl ProxyServer {
         let (client_message_sender, client_message_receiver) = flume::unbounded::<ClientMessage>();
         let (server_message_sender, server_message_receiver) = flume::unbounded::<ServerMessage>();
 
-        let messaging_processing_handle = {
+        // FIXME: move message processing into start
+        let message_processing_started = Arc::new(RwLock::new(false));
+        let message_processing_started_notify = Arc::new(Notify::new());
+
+        let message_processing_handle = {
             let ambient_server_conn = ambient_server_conn.clone();
+            let message_processing_started = message_processing_started.clone();
+            let message_processing_started_notify = message_processing_started_notify.clone();
             tokio::spawn(async move {
                 // accept a bi stream from the newly connected server
                 tracing::debug!("Accepting a bi stream from the game server");
@@ -301,6 +311,8 @@ impl ProxyServer {
                 let mut rx = IncomingStream::new(recv_stream);
 
                 tracing::debug!("Starting to message processing");
+                *message_processing_started.write() = true;
+                message_processing_started_notify.notify_waiters();
                 let mut receiver_stream = server_message_receiver.stream();
                 loop {
                     tokio::select! {
@@ -335,7 +347,9 @@ impl ProxyServer {
             ambient_server_conn,
             server_message_sender,
             client_message_receiver,
-            messaging_processing_handle,
+            message_processing_handle,
+            message_processing_started,
+            message_processing_started_notify,
             event_tx,
             player_conns: Default::default(),
             asset_store: Default::default(),
@@ -345,6 +359,16 @@ impl ProxyServer {
     async fn start(&self) {
         let mut client_message_receiver = self.client_message_receiver.stream();
         let (player_event_tx, player_event_rx) = flume::unbounded();
+
+        // wait for message processing
+        // FIXME: move message processing into here
+        loop {
+            if *self.message_processing_started.read() {
+                break;
+            }
+            self.message_processing_started_notify.notified().await;
+        }
+
         loop {
             tokio::select! {
                 // new player connection
@@ -375,10 +399,6 @@ impl ProxyServer {
                                 }
                             }
                         }
-                        ClientMessage::StoreAsset { key, data } => {
-                            tracing::debug!("Got store asset message from client: {} {}b", key, data.len());
-                            self.asset_store.write().entry(key).or_default().store(data);
-                        }
                     }
                 }
 
@@ -392,7 +412,7 @@ impl ProxyServer {
                 // server opening a new uni stream to a player
                 Ok((send_stream, recv_stream)) = self.ambient_server_conn.accept_bi() => {
                     if let Err(err) = self.handle_bi(send_stream, recv_stream).await {
-                        tracing::error!("Failed to handle uni stream: {:?}", err);
+                        tracing::error!("Failed to handle bi stream: {:?}", err);
                     }
                 }
 
@@ -509,7 +529,7 @@ impl ProxyServer {
             self.ambient_server_conn.open_bi().await?;
         write_framed(
             &mut server_send_stream,
-            &StreamInfo {
+            &ServerStreamHeader::PlayerStreamOpened {
                 player_id: player_id.clone(),
             },
         )
@@ -536,19 +556,28 @@ impl ProxyServer {
     }
 
     async fn handle_uni(&self, mut recv_stream: RecvStream) -> crate::Result<()> {
-        // hand decode the first message so then we can just copy the streams without decoding
-        let message: StreamInfo = read_framed(&mut recv_stream, 1024).await?;
+        // hand decode the first message so then we can just copy the streams without decoding in case of proxied stream
+        let header: ClientStreamHeader = read_framed(&mut recv_stream, 128 * 1024 * 1024).await?;
 
-        // get player connection
-        let Some(player_connection) = self.get_player_connection(&message.player_id) else {
-            return Err(anyhow!("Unknown player: {}", message.player_id))?;
-        };
+        match header {
+            ClientStreamHeader::OpenPlayerStream { player_id } => {
+                // get player connection
+                let Some(player_connection) = self.get_player_connection(&player_id) else {
+                    return Err(anyhow!("Unknown player: {}", player_id))?;
+                };
 
-        // open a uni stream to the player and copy the recv stream there
-        let send_stream = player_connection.open_uni().await?;
-        spawn_stream_copy(recv_stream, send_stream);
-
-        Ok(())
+                // open a uni stream to the player and copy the recv stream there
+                let send_stream = player_connection.open_uni().await?;
+                spawn_stream_copy(recv_stream, send_stream);
+                Ok(())
+            }
+            ClientStreamHeader::StoreAsset { key, data } => {
+                // store the asset in the asset store
+                tracing::debug!("Storing asset: {} {}b", key, data.len());
+                self.asset_store.write().entry(key).or_default().store(data);
+                Ok(())
+            }
+        }
     }
 
     async fn handle_bi(
@@ -557,11 +586,13 @@ impl ProxyServer {
         mut recv_stream: RecvStream,
     ) -> crate::Result<()> {
         // hand decode the first message so then we can just copy the streams without decoding
-        let message: StreamInfo = read_framed(&mut recv_stream, 1024).await?;
+        let ClientStreamHeader::OpenPlayerStream { player_id } = read_framed(&mut recv_stream, 1024).await? else {
+            return Err(anyhow!("Unexpected header"))?;
+        };
 
         // get player connection
-        let Some(player_connection) = self.get_player_connection(&message.player_id) else {
-            return Err(anyhow!("Unknown player: {}", message.player_id))?;
+        let Some(player_connection) = self.get_player_connection(&player_id) else {
+            return Err(anyhow!("Unknown player: {}", player_id))?;
         };
 
         // open a bi stream to the player and copy the server streams there
@@ -630,8 +661,8 @@ impl Drop for ProxyServer {
     fn drop(&mut self) {
         tracing::info!("Shutting down proxy server: {}", self.id);
 
-        // abort the messaging processing task
-        self.messaging_processing_handle.abort();
+        // abort the message processing task
+        self.message_processing_handle.abort();
 
         // close the proxy endpoint
         if let Some(proxy_endpoint) = self.proxy_endpoint.write().take() {
@@ -729,7 +760,7 @@ impl PlayerConnection {
         let mut send_stream = self.ambient_server_conn.open_uni().await?;
         write_framed(
             &mut send_stream,
-            &StreamInfo {
+            &ServerStreamHeader::PlayerStreamOpened {
                 player_id: self.player_id.clone(),
             },
         )
@@ -747,7 +778,7 @@ impl PlayerConnection {
             self.ambient_server_conn.open_bi().await?;
         write_framed(
             &mut server_send_stream,
-            &StreamInfo {
+            &ServerStreamHeader::PlayerStreamOpened {
                 player_id: self.player_id.clone(),
             },
         )

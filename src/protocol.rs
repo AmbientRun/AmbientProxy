@@ -23,14 +23,23 @@ pub enum ServerMessage {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum ClientMessage {
-    AllocateEndpoint { project_id: String },
-    StoreAsset { key: String, data: Vec<u8> },
+pub enum ServerStreamHeader {
+    /// Player opened a stream to the server
+    PlayerStreamOpened { player_id: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct StreamInfo {
-    pub player_id: String,
+pub enum ClientMessage {
+    AllocateEndpoint { project_id: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum ClientStreamHeader {
+    /// Open a stream to selected player
+    OpenPlayerStream { player_id: String },
+
+    /// Store asset
+    StoreAsset { key: String, data: Vec<u8> },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
