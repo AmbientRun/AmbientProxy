@@ -578,7 +578,7 @@ impl ProxyServer {
                 compression,
             } => {
                 // store the asset in the asset store
-                tracing::debug!("Storing asset: {} {}b", key, length);
+                tracing::debug!("Storing asset (receiving data): {} {}b", key, length);
 
                 if !compression.is_empty() {
                     tracing::warn!("Asset compression not supported: {:?}", compression);
@@ -608,9 +608,11 @@ impl ProxyServer {
                     proxy_server
                         .asset_store
                         .write()
-                        .entry(key)
+                        .entry(key.clone())
                         .or_default()
                         .store(data);
+
+                    tracing::debug!("Stored asset: {} {}b", key, length);
                 });
                 Ok(())
             }
