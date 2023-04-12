@@ -572,9 +572,17 @@ impl ProxyServer {
                 spawn_stream_copy(recv_stream, send_stream);
                 Ok(())
             }
-            ClientStreamHeader::StoreAsset { key, length } => {
+            ClientStreamHeader::StoreAsset {
+                key,
+                length,
+                compression,
+            } => {
                 // store the asset in the asset store
                 tracing::debug!("Storing asset: {} {}b", key, length);
+
+                if !compression.is_empty() {
+                    tracing::warn!("Asset compression not supported: {:?}", compression);
+                }
 
                 if length > ASSET_SIZE_LIMIT {
                     return Err(anyhow!(

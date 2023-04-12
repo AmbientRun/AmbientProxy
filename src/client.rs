@@ -57,6 +57,7 @@ async fn send_store_asset_message(
         &ClientStreamHeader::StoreAsset {
             key,
             length: data.len() as u32,
+            compression: "".into(),
         },
     )
     .await?;

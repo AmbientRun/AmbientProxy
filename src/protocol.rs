@@ -39,7 +39,11 @@ pub enum ClientStreamHeader {
     OpenPlayerStream { player_id: String },
 
     /// Store asset
-    StoreAsset { key: String, length: u32 },
+    StoreAsset {
+        key: String,
+        length: u32,
+        compression: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
