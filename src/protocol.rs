@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub const NO_COMPRESSION: &str = "";
 pub const GZIP_COMPRESSION: &str = "gzip";
 
+/// Messages sent from the proxy to the Ambient server
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ServerMessage {
     Allocation {
@@ -25,17 +26,20 @@ pub enum ServerMessage {
     },
 }
 
+/// Headers for streams sent from proxy to the Ambient server
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ServerStreamHeader {
     /// Player opened a stream to the server
     PlayerStreamOpened { player_id: String },
 }
 
+/// Messages sent from the Ambient server to the proxy
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ClientMessage {
     AllocateEndpoint { project_id: String },
 }
 
+/// Headers for streams sent from the Ambient server to the proxy
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ClientStreamHeader {
     /// Open a stream to selected player
@@ -49,7 +53,9 @@ pub enum ClientStreamHeader {
     },
 }
 
+/// Header for datagrams sent between the Ambient server and the proxy (both ways)
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DatagramInfo {
+    /// Recipient/origin of the datagram
     pub player_id: String,
 }
