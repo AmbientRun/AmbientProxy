@@ -22,7 +22,7 @@ use crate::{
     paths::{load_asset_data, path_to_key},
     protocol::{
         ClientMessage, ClientStreamHeader, DatagramInfo, ServerMessage, ServerStreamHeader,
-        GZIP_COMPRESSION,
+        GZIP_COMPRESSION, NO_COMPRESSION,
     },
     streams::{read_framed, write_framed, IncomingStream, OutgoingStream},
 };
@@ -60,7 +60,7 @@ async fn send_store_asset_message(
 
     let (data, compression) = if data.len() < MINIMUM_COMPRESSION_SIZE {
         // too small -> don't compress
-        (data, "".into())
+        (data, NO_COMPRESSION.into())
     } else {
         // compress the asset
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());

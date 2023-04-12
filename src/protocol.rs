@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
+pub const NO_COMPRESSION: &str = "";
 pub const GZIP_COMPRESSION: &str = "gzip";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
