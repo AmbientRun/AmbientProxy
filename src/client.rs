@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     fmt::Debug,
+    io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -8,6 +9,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use flate2::{write::GzEncoder, Compression};
 use parking_lot::{Mutex, RwLock};
 use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, TransportConfig};
 use rustls::{Certificate, RootCertStore};
@@ -20,6 +22,7 @@ use crate::{
     paths::{load_asset_data, path_to_key},
     protocol::{
         ClientMessage, ClientStreamHeader, DatagramInfo, ServerMessage, ServerStreamHeader,
+        GZIP_COMPRESSION,
     },
     streams::{read_framed, write_framed, IncomingStream, OutgoingStream},
 };
@@ -27,6 +30,8 @@ use crate::{
 const CERT: &[u8] = include_bytes!("./cert.der");
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+const MINIMUM_COMPRESSION_SIZE: usize = 1024;
 
 fn default_client_endpoint() -> crate::Result<Endpoint> {
     let mut endpoint = Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
@@ -52,15 +57,29 @@ async fn send_store_asset_message(
     data: Vec<u8>,
 ) -> crate::Result<()> {
     let mut send_stream = conn.open_uni().await?;
+
+    let (data, compression) = if data.len() < MINIMUM_COMPRESSION_SIZE {
+        // too small -> don't compress
+        (data, "".into())
+    } else {
+        // compress the asset
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&data)?;
+        (encoder.finish()?, GZIP_COMPRESSION.into())
+    };
+
+    // write the header
     write_framed(
         &mut send_stream,
         &ClientStreamHeader::StoreAsset {
             key,
             length: data.len() as u32,
-            compression: "".into(),
+            compression,
         },
     )
     .await?;
+
+    // write the rest of the data
     send_stream.write_all(&data).await?;
     send_stream.finish().await?;
     Ok(())

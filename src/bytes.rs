@@ -19,3 +19,16 @@ pub fn drop_prefix<T: for<'de> Deserialize<'de>>(data: Bytes) -> bincode::Result
     data.advance(header_len);
     Ok((header, data))
 }
+
+pub fn to_binary_prefix(count: impl Into<u64>) -> String {
+    let count = count.into();
+    if count < 1024 * 10 {
+        format!("{count}")
+    } else if count < 1024 * 1024 * 10 {
+        format!("{}K", count / 1024)
+    } else if count < 1024 * 1024 * 1024 * 10 {
+        format!("{}M", count / 1024 / 1024)
+    } else {
+        format!("{}G", count / 1024 / 1024 / 1024)
+    }
+}

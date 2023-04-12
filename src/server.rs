@@ -2,6 +2,7 @@ use std::{
     collections::{hash_map::DefaultHasher, HashMap},
     fmt::Debug,
     hash::{Hash, Hasher},
+    io::Write,
     net::{IpAddr, SocketAddr, TcpListener},
     ops::RangeInclusive,
     sync::{Arc, Weak},
@@ -16,6 +17,7 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
+use flate2::write::GzDecoder;
 use flume::{Receiver, Sender};
 use futures::StreamExt;
 use parking_lot::RwLock;
@@ -27,10 +29,11 @@ use tokio::{sync::Notify, task::JoinHandle};
 use tower_http::cors::CorsLayer;
 
 use crate::{
-    bytes::{drop_prefix, prefix},
+    bytes::{drop_prefix, prefix, to_binary_prefix},
     configuration::Settings,
     protocol::{
         ClientMessage, ClientStreamHeader, DatagramInfo, ServerMessage, ServerStreamHeader,
+        GZIP_COMPRESSION,
     },
     streams::{read_framed, spawn_stream_copy, write_framed, IncomingStream, OutgoingStream},
 };
@@ -578,10 +581,14 @@ impl ProxyServer {
                 compression,
             } => {
                 // store the asset in the asset store
-                tracing::debug!("Storing asset (receiving data): {} {}b", key, length);
+                tracing::debug!(
+                    "Storing asset (receiving data): {} {}B",
+                    key,
+                    to_binary_prefix(length)
+                );
 
-                if !compression.is_empty() {
-                    tracing::warn!("Asset compression not supported: {:?}", compression);
+                if !compression.is_empty() && compression != GZIP_COMPRESSION {
+                    return Err(anyhow!("Unsupported asset compression: {:?}", compression))?;
                 }
 
                 if length > ASSET_SIZE_LIMIT {
@@ -594,7 +601,7 @@ impl ProxyServer {
 
                 // read the asset data in a separate task
                 tokio::spawn(async move {
-                    let Ok(data) = recv_stream.read_to_end(length as usize).await else {
+                    let Ok(mut data) = recv_stream.read_to_end(length as usize).await else {
                         tracing::warn!("Failed to read asset data");
                         return;
                     };
@@ -605,6 +612,22 @@ impl ProxyServer {
                         return;
                     };
 
+                    // decompress if needed
+                    if compression == GZIP_COMPRESSION {
+                        let mut decoder = GzDecoder::new(Vec::new());
+                        if let Err(err) = decoder.write_all(&data) {
+                            tracing::warn!("Failed to decompress asset data: {}", err);
+                            return;
+                        }
+                        let Ok(mut decompressed) = decoder.finish() else {
+                            tracing::warn!("Failed to decompress asset data");
+                            return;
+                        };
+                        std::mem::swap(&mut data, &mut decompressed);
+                    }
+
+                    let size = data.len();
+
                     proxy_server
                         .asset_store
                         .write()
@@ -612,7 +635,16 @@ impl ProxyServer {
                         .or_default()
                         .store(data);
 
-                    tracing::debug!("Stored asset: {} {}b", key, length);
+                    if compression.is_empty() {
+                        tracing::debug!("Stored asset: {} {}B", key, to_binary_prefix(length));
+                    } else {
+                        tracing::debug!(
+                            "Stored asset: {} {}B ({}B after decompression)",
+                            key,
+                            to_binary_prefix(length),
+                            to_binary_prefix(size as u64),
+                        );
+                    }
                 });
                 Ok(())
             }

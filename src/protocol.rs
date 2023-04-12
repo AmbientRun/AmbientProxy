@@ -2,6 +2,8 @@ use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
+pub const GZIP_COMPRESSION: &str = "gzip";
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ServerMessage {
     Allocation {
