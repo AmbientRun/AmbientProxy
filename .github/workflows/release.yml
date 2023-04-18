@@ -49,6 +49,8 @@ jobs:
         # get the version number from ref (example: GIHUB_REF = refs/tags/v1.2.3 -> 1.2.3)
         run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
+      # Note: it's crucial to push the commit first and then the tag referencing it. Doing it at the same time will cause failure in this step
+      # Issue: https://github.com/docker/build-push-action/issues/627#issuecomment-1396108641
       - id: docker-push-tagged
         name: Tag Docker image and push to Google Artifact Registry
         uses: docker/build-push-action@v4
