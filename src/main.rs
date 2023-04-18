@@ -1,14 +1,11 @@
 use ambient_proxy::{
-    configuration::get_configuration,
-    server::ManagementServer,
-    telemetry::{get_subscriber, init_subscriber},
+    configuration::get_configuration, server::ManagementServer, telemetry::init_subscriber,
 };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // set up tracing and logging
-    let subscriber = get_subscriber("ambient-proxy".into(), "info".into(), std::io::stdout);
-    init_subscriber(subscriber);
+    init_subscriber("ambient-proxy".into(), "info".into(), std::io::stdout);
 
     // read configuration
     let configuration = get_configuration().expect("Failed to read configuration.");

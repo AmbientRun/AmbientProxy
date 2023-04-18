@@ -161,7 +161,12 @@ impl ManagementServer {
     }
 
     fn start_http_interface(listener: TcpListener, proxies: Arc<ProxyStore>, config: Settings) {
-        tracing::debug!("Starting HTTP interface on: {:?}", listener.local_addr());
+        tracing::debug!(
+            "Starting HTTP interface on: {:?}",
+            listener
+                .local_addr()
+                .expect("Listener should have a local address")
+        );
         let router = Router::new()
             .route("/ping", get(|| async move { "ok" }))
             .route("/content/:id/*path", get(get_asset))
