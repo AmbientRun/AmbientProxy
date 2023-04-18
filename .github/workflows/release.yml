@@ -55,5 +55,4 @@ jobs:
         with:
           push: true
           tags: |
-             europe-west1-docker.pkg.dev/ambient-733e7/ambient/ambient-proxy:${{ steps.get-tag.outputs.short_ref }}
-             europe-west1-docker.pkg.dev/ambient-733e7/ambient/ambient-proxy:latest
+             europe-west1-docker.pkg.dev/ambient-733e7/ambient/ambient-proxy:testing
