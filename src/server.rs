@@ -21,11 +21,16 @@ use flate2::write::GzDecoder;
 use flume::{Receiver, Sender};
 use futures::StreamExt;
 use parking_lot::RwLock;
+use prometheus_client::registry::Registry;
 use quinn::{
     Connecting, Connection, Endpoint, RecvStream, SendStream, ServerConfig, TransportConfig, VarInt,
 };
 use rustls::{Certificate, PrivateKey};
-use tokio::{sync::Notify, task::JoinHandle};
+use tokio::{
+    sync::Notify,
+    task::JoinHandle,
+    time::{interval, MissedTickBehavior},
+};
 use tower_http::cors::CorsLayer;
 
 use crate::{
@@ -36,6 +41,7 @@ use crate::{
         GZIP_COMPRESSION,
     },
     streams::{read_framed, spawn_stream_copy, write_framed, IncomingStream, OutgoingStream},
+    telemetry::{AssetRequestResult, ConnectionRole, Metrics},
 };
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -44,27 +50,60 @@ const ASSET_SIZE_LIMIT: u32 = 128 * 1024 * 1024;
 const CERT: &[u8] = include_bytes!("./cert.der");
 const CERT_KEY: &[u8] = include_bytes!("./cert.key.der");
 
+struct AppState {
+    registry: Registry,
+    metrics: Metrics,
+    proxies: ProxyStore,
+    config: Settings,
+}
+
+impl AppState {
+    fn with_settings(config: Settings) -> Self {
+        let mut registry = Registry::with_prefix("proxy");
+        let metrics = Metrics::new_with_registery(&mut registry);
+        Self {
+            registry,
+            metrics,
+            proxies: Default::default(),
+            config,
+        }
+    }
+}
+
 #[derive(Default)]
 struct ProxyStore {
     proxies: RwLock<HashMap<uuid::Uuid, (JoinHandle<()>, Arc<ProxyServer>)>>,
 }
 
 impl ProxyStore {
-    fn insert(&self, id: uuid::Uuid, proxy: Arc<ProxyServer>, handle: JoinHandle<()>) {
-        self.proxies.write().insert(id, (handle, proxy));
+    fn insert(&self, id: uuid::Uuid, proxy: Arc<ProxyServer>, handle: JoinHandle<()>) -> usize {
+        let mut map = self.proxies.write();
+        map.insert(id, (handle, proxy));
+        map.len()
     }
 
     fn get_proxy(&self, id: &uuid::Uuid) -> Option<Arc<ProxyServer>> {
         self.proxies.read().get(id).map(|(_, proxy)| proxy).cloned()
     }
 
-    fn remove(&self, id: &uuid::Uuid) -> Option<Arc<ProxyServer>> {
-        if let Some((handle, proxy)) = self.proxies.write().remove(id) {
+    fn remove(&self, id: &uuid::Uuid) -> (usize, Option<Arc<ProxyServer>>) {
+        let mut map = self.proxies.write();
+        let proxy = map.remove(id).map(|(handle, proxy)| {
             handle.abort();
-            Some(proxy)
-        } else {
-            None
-        }
+            proxy
+        });
+        (map.len(), proxy)
+    }
+
+    fn fold_proxies<B, F>(&self, init: B, f: F) -> B
+    where
+        F: FnMut(B, Arc<ProxyServer>) -> B,
+    {
+        self.proxies
+            .read()
+            .iter()
+            .map(|(_, (_, proxy))| proxy.clone())
+            .fold(init, f)
     }
 }
 
@@ -75,16 +114,13 @@ pub struct ManagementServer {
     /// HTTP interface listener (ping, assets, etc.)
     http_listener: TcpListener,
 
-    /// Currently allocated proxies
-    proxies: Arc<ProxyStore>,
-
     /// Address to bind to
     bind_addr: IpAddr,
 
     /// Public address of the HTTP interface, hostname:port (to advertise to clients)
     http_public_addr: String,
 
-    config: Settings,
+    app_state: Arc<AppState>,
 }
 
 impl ManagementServer {
@@ -107,10 +143,9 @@ impl ManagementServer {
         Ok(Self {
             endpoint,
             http_listener: TcpListener::bind(http_addr)?,
-            proxies: Default::default(),
             bind_addr,
             http_public_addr: format!("{http_public_host_name}:{http_port}"),
-            config,
+            app_state: Arc::new(AppState::with_settings(config)),
         })
     }
 
@@ -118,15 +153,17 @@ impl ManagementServer {
         let Self {
             endpoint,
             http_listener,
-            proxies,
             bind_addr,
             http_public_addr,
-            config,
+            app_state,
         } = self;
 
-        Self::start_http_interface(http_listener, proxies.clone(), config.clone());
+        Self::start_http_interface(http_listener, app_state.clone());
 
         let (tx, rx) = flume::unbounded();
+
+        let mut metrics_update_interval = interval(Duration::from_secs_f32(10.));
+        metrics_update_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -134,15 +171,16 @@ impl ManagementServer {
                     match Self::handle_connection(
                         conn,
                         bind_addr,
-                        config.proxy_port_range(),
-                        config.public_host_name.clone(),
+                        app_state.clone(),
                         http_public_addr.clone(),
                         tx.clone(),
                     )
                     .await
                     {
                         Ok((id, handle, proxy_server)) => {
-                            proxies.insert(id, proxy_server, handle);
+                            let proxies_count = app_state.proxies.insert(id, proxy_server, handle);
+                            app_state.metrics.inc_connections(ConnectionRole::Server);
+                            app_state.metrics.set_current_connections(ConnectionRole::Server, proxies_count);
                         }
                         Err(err) => {
                             tracing::error!("Failed handling the connection: {:?}", err);
@@ -152,15 +190,27 @@ impl ManagementServer {
                 Ok(event) = rx.recv_async() => {
                     match event {
                         ProxyEvent::Stopped { id } => {
-                            proxies.remove(&id);
+                            let (proxies_count, _) = app_state.proxies.remove(&id);
+                            app_state.metrics.set_current_connections(ConnectionRole::Server, proxies_count);
                         }
                     }
+                }
+                _ = metrics_update_interval.tick() => {
+                    let client_connections_count = app_state.proxies.fold_proxies(0, |count, proxy| {
+                        count + proxy.player_conns.read().len()
+                    });
+                    app_state.metrics.set_current_connections(ConnectionRole::Client, client_connections_count);
+
+                    let assets_size = app_state.proxies.fold_proxies(0, |size, proxy| {
+                        size + proxy.total_assets_size()
+                    });
+                    app_state.metrics.set_current_assets_size_bytes(assets_size);
                 }
             }
         }
     }
 
-    fn start_http_interface(listener: TcpListener, proxies: Arc<ProxyStore>, config: Settings) {
+    fn start_http_interface(listener: TcpListener, app_state: Arc<AppState>) {
         tracing::debug!(
             "Starting HTTP interface on: {:?}",
             listener
@@ -170,7 +220,8 @@ impl ManagementServer {
         let router = Router::new()
             .route("/ping", get(|| async move { "ok" }))
             .route("/content/:id/*path", get(get_asset))
-            .with_state((proxies, config))
+            .route("/metrics", get(get_metrics))
+            .with_state(app_state)
             .layer(
                 CorsLayer::new()
                     .allow_origin(tower_http::cors::Any)
@@ -190,8 +241,7 @@ impl ManagementServer {
     async fn handle_connection(
         conn: Connecting,
         bind_addr: IpAddr,
-        ports: RangeInclusive<u16>,
-        public_host_name: String,
+        app_state: Arc<AppState>,
         http_public_addr: String,
         event_tx: flume::Sender<ProxyEvent>,
     ) -> crate::Result<(uuid::Uuid, JoinHandle<()>, Arc<ProxyServer>)> {
@@ -202,11 +252,12 @@ impl ManagementServer {
             ProxyServer::new(
                 allocation_id,
                 conn,
-                public_host_name,
+                app_state.config.get_http_public_host_name(),
                 http_public_addr,
                 bind_addr,
-                ports,
+                app_state.config.proxy_port_range(),
                 event_tx,
+                app_state,
             )
             .await?,
         );
@@ -247,6 +298,7 @@ struct ProxyServer {
 
     player_conns: RwLock<HashMap<String, (JoinHandle<()>, Arc<PlayerConnection>)>>,
     asset_store: RwLock<HashMap<String, Asset>>,
+    metrics: Metrics,
 }
 
 impl ProxyServer {
@@ -287,6 +339,7 @@ impl ProxyServer {
         bind_addr: IpAddr,
         ports: RangeInclusive<u16>,
         event_tx: flume::Sender<ProxyEvent>,
+        app_state: Arc<AppState>,
     ) -> anyhow::Result<Self> {
         // create communication channels
         let (client_message_sender, client_message_receiver) = flume::unbounded::<ClientMessage>();
@@ -310,7 +363,7 @@ impl ProxyServer {
                 let mut tx = OutgoingStream::new(send_stream);
                 let mut rx = IncomingStream::new(recv_stream);
 
-                tracing::debug!("Starting to message processing");
+                tracing::debug!("Starting message processing");
                 *message_processing_started.write() = true;
                 message_processing_started_notify.notify_waiters();
                 let mut receiver_stream = server_message_receiver.stream();
@@ -353,6 +406,7 @@ impl ProxyServer {
             event_tx,
             player_conns: Default::default(),
             asset_store: Default::default(),
+            metrics: app_state.metrics.clone(),
         })
     }
 
@@ -376,6 +430,7 @@ impl ProxyServer {
                     match self.handle_connection(conn, player_event_tx.clone()).await {
                         Ok((player_id, handle, connection)) => {
                             self.player_conns.write().insert(player_id, (handle, connection));
+                            self.metrics.inc_connections(ConnectionRole::Client);
                         }
                         Err(err) => {
                             tracing::error!("Failed to handle incoming client connection: {:?}", err);
@@ -731,6 +786,14 @@ impl ProxyServer {
         }
         Err(anyhow::anyhow!("Timed out getting asset: {}", asset_id))
     }
+
+    fn total_assets_size(&self) -> usize {
+        self.asset_store
+            .read()
+            .values()
+            .map(|asset| asset.data.as_ref().map(|data| data.len()).unwrap_or(0))
+            .sum()
+    }
 }
 
 impl Drop for ProxyServer {
@@ -901,26 +964,64 @@ impl Asset {
 
 async fn get_asset(
     Path((id, path)): Path<(String, String)>,
-    State((proxy_store, config)): State<(Arc<ProxyStore>, Settings)>,
+    State(app_state): State<Arc<AppState>>,
 ) -> Result<Bytes, StatusCode> {
     tracing::debug!("get_asset: {} {}", id, path);
     let Ok(allocation_id) = uuid::Uuid::try_from(id.as_str()) else {
         tracing::warn!("Invalid allocation id: {}", id);
+        app_state.metrics.inc_asset_requests(AssetRequestResult::Malformed);
         return Err(StatusCode::BAD_REQUEST);
     };
-    let Some(proxy_server) = proxy_store.get_proxy(&allocation_id) else {
+    let Some(proxy_server) = app_state.proxies.get_proxy(&allocation_id) else {
         tracing::warn!("Unknown allocation id: {}", id);
+        app_state.metrics.inc_asset_requests(AssetRequestResult::AllocationNotFound);
         return Err(StatusCode::NOT_FOUND);
     };
     match proxy_server
-        .get_asset(path, config.get_assets_download_timeout())
+        .get_asset(path, app_state.config.get_assets_download_timeout())
         .await
     {
-        Ok(None) => Err(StatusCode::NOT_FOUND),
-        Ok(Some(data)) => Ok(data),
+        Ok(None) => {
+            app_state
+                .metrics
+                .inc_asset_requests(AssetRequestResult::AssetNotFound);
+            Err(StatusCode::NOT_FOUND)
+        }
+        Ok(Some(data)) => {
+            app_state
+                .metrics
+                .inc_asset_requests(AssetRequestResult::Success);
+            app_state
+                .metrics
+                .observe_asset_response_size_bytes(data.len());
+            Ok(data)
+        }
         Err(err) => {
             tracing::error!("Failed to get asset: {:?}", err);
+            app_state
+                .metrics
+                .inc_asset_requests(AssetRequestResult::Error);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+async fn get_metrics(
+    State(app_state): State<Arc<AppState>>,
+) -> Result<axum::response::Response, axum::http::StatusCode> {
+    use axum::response::IntoResponse;
+    use prometheus_client::encoding::text::encode;
+
+    let mut body = String::new();
+    if encode(&mut body, &app_state.registry).is_err() {
+        return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let mut response = body.into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(
+            "application/openmetrics-text; version=1.0.0; charset=utf-8",
+        ),
+    );
+    Ok(response)
 }
