@@ -128,6 +128,7 @@ pub struct Builder {
     proxy_server: Option<String>,
     project_id: String,
     assets_path: Option<PathBuf>,
+    assets_root_override: Option<String>,
     user_agent: Option<String>,
 }
 
@@ -156,6 +157,11 @@ impl Builder {
         self
     }
 
+    pub fn assets_root_override(mut self, assets_root_override: String) -> Self {
+        self.assets_root_override = Some(assets_root_override);
+        self
+    }
+
     pub fn user_agent(mut self, user_agent: String) -> Self {
         self.user_agent = Some(user_agent);
         self
@@ -167,8 +173,10 @@ impl Builder {
             None => default_client_endpoint()?,
         };
 
-        let Some(assets_path) = self.assets_path else {
-            return Err(anyhow::anyhow!("assets_path is required"))?;
+        if self.assets_path.is_none() && self.assets_root_override.is_none() {
+            return Err(anyhow::anyhow!(
+                "assets_path or assets_root_override is required"
+            ))?;
         };
 
         let Some(mut proxy_server) = self.proxy_server else {
@@ -196,7 +204,14 @@ impl Builder {
             }
         }
 
-        Ok(Client::connect(proxy_server, self.project_id, assets_path, endpoint).await?)
+        Ok(Client::connect(
+            proxy_server,
+            self.project_id,
+            self.assets_path,
+            self.assets_root_override,
+            endpoint,
+        )
+        .await?)
     }
 }
 
@@ -206,14 +221,16 @@ pub struct Client {
     tx: OutgoingStream,
     pending: Arc<PendingResources>,
     project_id: String,
-    assets_path: PathBuf,
+    assets_path: Option<PathBuf>,
+    assets_root_override: Option<String>,
 }
 
 impl Client {
     pub async fn connect<T: ToSocketAddrs + Debug + Clone>(
         proxy_server: T,
         project_id: String,
-        assets_path: PathBuf,
+        assets_path: Option<PathBuf>,
+        assets_root_override: Option<String>,
         endpoint: Endpoint,
     ) -> crate::Result<Self> {
         let server_addr = lookup_host(proxy_server.clone())
@@ -235,7 +252,12 @@ impl Client {
             tx,
             pending: Default::default(),
             project_id,
-            assets_path: assets_path.canonicalize()?,
+            assets_path: if let Some(path) = assets_path {
+                Some(path.canonicalize()?)
+            } else {
+                None
+            },
+            assets_root_override,
         })
     }
 
@@ -251,6 +273,7 @@ impl Client {
             pending,
             project_id,
             assets_path,
+            assets_root_override,
         } = self;
 
         let (client_message_channel_tx, client_meesage_channel_rx) =
@@ -276,15 +299,24 @@ impl Client {
                             ServerMessage::Allocation { .. } => {
                                 *endpoint_allocated.write() = true;
                                 endpoint_allocated_notify.notify_waiters();
-                                on_endpoint_allocated(message.try_into().expect("Already matched allocation message"));
+                                let mut message: AllocatedEndpoint = message.try_into().expect("Already matched allocation message");
+                                if let Some(assets_root) = assets_root_override.as_ref() {
+                                    tracing::debug!("Overriding assets root: {:?}", &assets_root);
+                                    message.assets_root = assets_root.clone();
+                                }
+                                on_endpoint_allocated(message);
                             }
                             ServerMessage::PlayerConnected { player_id } => {
                                 on_player_connected(player_id.clone(), ProxiedConnection { player_id, conn: conn.clone(), pending: pending.clone() });
                             }
                             ServerMessage::RequestAsset { key } => {
+                                let Some(path) = &assets_path else {
+                                    tracing::error!("Assets path is not set");
+                                    continue;
+                                };
                                 // load asset from disk
                                 tracing::trace!("Loading asset: {:?}", &key);
-                                let Ok(data) = load_asset_data(&assets_path, &key).await else {
+                                let Ok(data) = load_asset_data(path, &key).await else {
                                     tracing::warn!("Failed to open asset file: {:?}", &key);
                                     continue;
                                 };
@@ -388,7 +420,7 @@ pub struct ClientController {
     proxy_connection: Connection,
     tx: flume::Sender<ClientMessage>,
     project_id: String,
-    assets_path: PathBuf,
+    assets_path: Option<PathBuf>,
 
     endpoint_allocated: Arc<RwLock<bool>>,
     endpoint_allocated_notify: Arc<Notify>,
@@ -403,7 +435,7 @@ impl ClientController {
         proxy_connection: Connection,
         tx: flume::Sender<ClientMessage>,
         project_id: String,
-        assets_path: PathBuf,
+        assets_path: Option<PathBuf>,
         endpoint_allocated: Arc<RwLock<bool>>,
         endpoint_allocated_notify: Arc<Notify>,
     ) -> Self {
@@ -443,9 +475,13 @@ impl ClientController {
     }
 
     pub fn pre_cache_assets(&mut self, directory: impl AsRef<Path>) -> crate::Result<()> {
+        let Some(assets_path) = &self.assets_path else {
+            return Err(anyhow::anyhow!("Assets path is not set"))?;
+        };
+
         // get the path to the directory and make sure it's inside the assets directory
-        let path = self.assets_path.join(directory).canonicalize()?;
-        if !path.starts_with(&self.assets_path) {
+        let path = assets_path.join(directory).canonicalize()?;
+        if !path.starts_with(assets_path) {
             return Err(anyhow::anyhow!("Directory is outside of assets directory"))?;
         };
 
@@ -461,6 +497,11 @@ impl ClientController {
     }
 
     fn start_pre_caching_task_if_needed(&self) {
+        let Some(assets_path) = &self.assets_path else {
+            tracing::warn!("Assets path is not set");
+            return;
+        };
+
         // make sure we only start one task
         let mut pre_caching_task_running = self.pre_caching_task_running.write();
         if *pre_caching_task_running {
@@ -470,7 +511,7 @@ impl ClientController {
 
         let endpoint_allocated = self.endpoint_allocated.clone();
         let endpoint_allocated_notify = self.endpoint_allocated_notify.clone();
-        let assets_path = self.assets_path.clone();
+        let assets_path = assets_path.clone();
         let pre_cache_assets_stack = self.pre_cache_assets_stack.clone();
         let conn = self.proxy_connection.clone();
         let pre_caching_task_running = self.pre_caching_task_running.clone();
