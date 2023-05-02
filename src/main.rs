@@ -5,7 +5,7 @@ use ambient_proxy::{
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // set up tracing and logging
-    init_subscriber("ambient-proxy".into(), "info".into(), std::io::stdout);
+    init_subscriber("ambient_proxy".into(), "info".into(), std::io::stdout);
 
     // read configuration
     let configuration = get_configuration().expect("Failed to read configuration.");
