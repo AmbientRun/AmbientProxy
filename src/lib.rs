@@ -4,6 +4,9 @@ pub mod client;
 #[cfg(feature = "server")]
 pub mod configuration;
 
+#[cfg(feature = "server")]
+mod friendly_id;
+
 pub mod paths;
 pub mod protocol;
 

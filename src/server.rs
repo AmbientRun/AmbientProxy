@@ -36,6 +36,7 @@ use tower_http::cors::CorsLayer;
 use crate::{
     bytes::{drop_prefix, prefix, to_binary_prefix},
     configuration::Settings,
+    friendly_id::friendly_id,
     protocol::{
         ClientMessage, ClientStreamHeader, DatagramInfo, ServerMessage, ServerStreamHeader,
         GZIP_COMPRESSION,
@@ -556,10 +557,10 @@ impl ProxyServer {
             conn.remote_address()
         );
         let conn = conn.await?;
-        // accept the first bi stream from the player to know who they are
-        let (send_stream, mut recv_stream) = conn.accept_bi().await?;
-        let player_id: String = read_framed(&mut recv_stream, 1024).await?;
-        tracing::info!("Connected player id: {}", player_id);
+
+        // assign random id to player
+        let player_id = friendly_id();
+        tracing::info!("Generated id for connected player: {}", player_id);
 
         // notify the server
         self.server_message_sender
@@ -579,20 +580,6 @@ impl ProxyServer {
             )
             .await?,
         );
-
-        // open this bi stream to the server and send the player_id again
-        let (mut server_send_stream, server_recv_stream) =
-            self.ambient_server_conn.open_bi().await?;
-        write_framed(
-            &mut server_send_stream,
-            &ServerStreamHeader::PlayerStreamOpened {
-                player_id: player_id.clone(),
-            },
-        )
-        .await?;
-        write_framed(&mut server_send_stream, &player_id).await?;
-        spawn_stream_copy(recv_stream, server_send_stream);
-        spawn_stream_copy(server_recv_stream, send_stream);
 
         // start handling player connection
         let handle = {
