@@ -55,6 +55,7 @@ jobs:
         name: Tag Docker image and push to Google Artifact Registry
         uses: docker/build-push-action@v4
         with:
+          context: .
           push: true
           tags: |
              europe-west1-docker.pkg.dev/ambient-733e7/ambient/ambient-proxy:${{ steps.get-version.outputs.version }}
