@@ -664,7 +664,7 @@ impl ProxiedConnection {
         }
     }
 
-    pub async fn send_datagram(&self, data: Bytes) -> crate::Result<()> {
+    pub fn send_datagram(&self, data: Bytes) -> crate::Result<()> {
         Ok(self.conn.send_datagram(crate::bytes::prefix(
             &DatagramInfo {
                 player_id: self.player_id.clone(),
