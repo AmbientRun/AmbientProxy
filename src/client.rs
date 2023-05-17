@@ -12,7 +12,7 @@ use bytes::Bytes;
 use flate2::{write::GzEncoder, Compression};
 use parking_lot::{Mutex, RwLock};
 use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, TransportConfig};
-use rustls::{Certificate, RootCertStore};
+use rustls::RootCertStore;
 use tokio::{
     net::{lookup_host, ToSocketAddrs},
     sync::Notify,
@@ -27,21 +27,28 @@ use crate::{
     streams::{read_framed, write_framed, IncomingStream, OutgoingStream},
 };
 
-const CERT: &[u8] = include_bytes!("./cert.der");
-
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 const MINIMUM_COMPRESSION_SIZE: usize = 1024;
 
 fn default_client_endpoint() -> crate::Result<Endpoint> {
     let mut endpoint = Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
-    let cert = Certificate(CERT.to_vec());
+    #[allow(unused_mut)]
     let mut roots = RootCertStore::empty();
-    roots.add(&cert).unwrap();
-    let crypto = rustls::ClientConfig::builder()
+    #[cfg(feature = "tls-roots")]
+    {
+        match rustls_native_certs::load_native_certs() {
+            Ok(certs) => roots.add_parsable_certificates(
+                &certs.into_iter().map(|cert| cert.0).collect::<Vec<_>>(),
+            ),
+            Err(error) => return Err(error.into()),
+        };
+    }
+    let mut crypto = rustls::ClientConfig::builder()
         .with_safe_defaults()
         .with_root_certificates(roots)
         .with_no_client_auth();
+    crypto.alpn_protocols = vec![b"ambient-proxy-03".to_vec()];
     let mut transport = TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs_f32(1.)));
     transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("Should fit in VarInt")));

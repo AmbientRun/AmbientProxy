@@ -1,5 +1,6 @@
 use std::ops::RangeInclusive;
 
+use rustls::{Certificate, PrivateKey};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -35,6 +36,12 @@ pub struct Settings {
     ///
     /// Defaults to 60 seconds
     pub assets_download_timeout: u32,
+
+    /// Certificate file path
+    pub cert_file: String,
+
+    /// Certificate key file path
+    pub cert_key_file: String,
 }
 
 impl Settings {
@@ -61,6 +68,42 @@ impl Settings {
             .parse::<std::net::IpAddr>()
             .expect("Failed to parse bind address.")
     }
+
+    pub fn load_certificate_chain(&self) -> Result<Vec<Certificate>, anyhow::Error> {
+        let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(
+            std::fs::File::open(self.cert_file.clone())?,
+        ))?
+        .into_iter()
+        .map(Certificate)
+        .collect();
+        tracing::debug!(
+            "Loaded {} certificates from {}",
+            certs.len(),
+            &self.cert_file
+        );
+        Ok(certs)
+    }
+
+    pub fn load_private_key(&self) -> Result<PrivateKey, anyhow::Error> {
+        let key_bytes = rustls_pemfile::read_all(&mut std::io::BufReader::new(
+            std::fs::File::open(self.cert_key_file.clone())?,
+        ))?
+        .into_iter()
+        .filter_map(|item| match item {
+            rustls_pemfile::Item::RSAKey(key) => Some(key),
+            rustls_pemfile::Item::PKCS8Key(key) => Some(key),
+            rustls_pemfile::Item::ECKey(key) => Some(key),
+            _ => None,
+        })
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
+        tracing::debug!(
+            "Loaded private key ({}B) from {}",
+            key_bytes.len(),
+            &self.cert_key_file
+        );
+        Ok(PrivateKey(key_bytes))
+    }
 }
 
 impl Default for Settings {
@@ -74,6 +117,8 @@ impl Default for Settings {
             http_public_host_name: Default::default(),
             http_port: Default::default(),
             assets_download_timeout: 60,
+            cert_file: "self-signed-certs/cert.pem".into(),
+            cert_key_file: "self-signed-certs/key.pem".into(),
         }
     }
 }
