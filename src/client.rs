@@ -233,7 +233,7 @@ pub struct Client {
 }
 
 impl Client {
-    pub async fn connect<T: ToSocketAddrs + Debug + Clone>(
+    pub async fn connect<T: ToSocketAddrs + ToString + Debug + Clone>(
         proxy_server: T,
         project_id: String,
         assets_path: Option<PathBuf>,
@@ -245,8 +245,14 @@ impl Client {
             .next()
             .ok_or_else(|| anyhow::anyhow!("{:?} not found", proxy_server))?;
 
+        let proxy_server = proxy_server.to_string();
+        let proxy_host = proxy_server
+            .split(':')
+            .next()
+            .unwrap_or(proxy_server.as_str());
+
         let conn = endpoint
-            .connect(server_addr, "localhost")
+            .connect(server_addr, proxy_host)
             .map_err(anyhow::Error::from)?
             .await?;
         let (send_stream, recv_stream) = conn.open_bi().await?;
