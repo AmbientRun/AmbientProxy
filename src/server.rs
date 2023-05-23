@@ -48,9 +48,6 @@ use crate::{
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const ASSET_SIZE_LIMIT: u32 = 128 * 1024 * 1024;
 
-const CERT: &[u8] = include_bytes!("./cert.der");
-const CERT_KEY: &[u8] = include_bytes!("./cert.key.der");
-
 struct AppState {
     registry: Registry,
     metrics: Metrics,
@@ -121,6 +118,12 @@ pub struct ManagementServer {
     /// Public address of the HTTP interface, hostname:port (to advertise to clients)
     http_public_addr: String,
 
+    /// Certificate chain
+    certificate_chain: Vec<Certificate>,
+
+    /// Private key
+    private_key: PrivateKey,
+
     app_state: Arc<AppState>,
 }
 
@@ -130,10 +133,20 @@ impl ManagementServer {
         let server_addr = SocketAddr::from((bind_addr, config.management_port));
         let http_addr = SocketAddr::from((bind_addr, config.get_http_port()));
 
-        let cert = Certificate(CERT.to_vec());
-        let cert_key = PrivateKey(CERT_KEY.to_vec());
-        let mut server_conf =
-            ServerConfig::with_single_cert(vec![cert], cert_key).map_err(anyhow::Error::from)?;
+        let certificate_chain = config.load_certificate_chain()?;
+        let private_key = config.load_private_key()?;
+
+        let mut tls_config = rustls::ServerConfig::builder()
+            .with_safe_default_cipher_suites()
+            .with_safe_default_kx_groups()
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certificate_chain.clone(), private_key.clone())?;
+        tls_config.max_early_data_size = u32::MAX;
+        tls_config.alpn_protocols = vec![b"ambient-proxy-03".to_vec()];
+
+        let mut server_conf = ServerConfig::with_crypto(Arc::new(tls_config));
         let mut transport = TransportConfig::default();
         transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("Should fit in VarInt")));
         server_conf.transport = Arc::new(transport);
@@ -146,6 +159,8 @@ impl ManagementServer {
             http_listener: TcpListener::bind(http_addr)?,
             bind_addr,
             http_public_addr: format!("{http_public_host_name}:{http_port}"),
+            certificate_chain,
+            private_key,
             app_state: Arc::new(AppState::with_settings(config)),
         })
     }
@@ -156,6 +171,8 @@ impl ManagementServer {
             http_listener,
             bind_addr,
             http_public_addr,
+            certificate_chain,
+            private_key,
             app_state,
         } = self;
 
@@ -174,6 +191,8 @@ impl ManagementServer {
                         bind_addr,
                         app_state.clone(),
                         http_public_addr.clone(),
+                        certificate_chain.clone(),
+                        private_key.clone(),
                         tx.clone(),
                     )
                     .await
@@ -244,6 +263,8 @@ impl ManagementServer {
         bind_addr: IpAddr,
         app_state: Arc<AppState>,
         http_public_addr: String,
+        certificate_chain: Vec<Certificate>,
+        private_key: PrivateKey,
         event_tx: flume::Sender<ProxyEvent>,
     ) -> crate::Result<(uuid::Uuid, JoinHandle<()>, Arc<ProxyServer>)> {
         tracing::info!("Got a new connection from: {:?}", conn.remote_address());
@@ -257,6 +278,8 @@ impl ManagementServer {
                 http_public_addr,
                 bind_addr,
                 app_state.config.proxy_port_range(),
+                certificate_chain,
+                private_key,
                 event_tx,
                 app_state,
             )
@@ -288,6 +311,8 @@ struct ProxyServer {
     http_public_addr: String,
     bind_addr: IpAddr,
     ports: RangeInclusive<u16>,
+    certificate_chain: Vec<Certificate>,
+    private_key: PrivateKey,
 
     ambient_server_conn: Connection,
     server_message_sender: Sender<ServerMessage>,
@@ -309,10 +334,20 @@ impl ProxyServer {
         addr: IpAddr,
         ports: RangeInclusive<u16>,
         mut allocation_seed: impl Hasher,
+        cert_chain: Vec<Certificate>,
+        cert_key: PrivateKey,
     ) -> anyhow::Result<Endpoint> {
-        let cert = Certificate(CERT.to_vec());
-        let cert_key = PrivateKey(CERT_KEY.to_vec());
-        let mut server_conf = ServerConfig::with_single_cert(vec![cert], cert_key)?;
+        let mut tls_config = rustls::ServerConfig::builder()
+            .with_safe_default_cipher_suites()
+            .with_safe_default_kx_groups()
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, cert_key)?;
+        tls_config.max_early_data_size = u32::MAX;
+        tls_config.alpn_protocols = vec![b"ambient-02".to_vec()];
+
+        let mut server_conf = ServerConfig::with_crypto(Arc::new(tls_config));
         let mut transport = TransportConfig::default();
         transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("Should fit in VarInt")));
         server_conf.transport = Arc::new(transport);
@@ -339,6 +374,8 @@ impl ProxyServer {
         http_public_addr: String,
         bind_addr: IpAddr,
         ports: RangeInclusive<u16>,
+        certificate_chain: Vec<Certificate>,
+        private_key: PrivateKey,
         event_tx: flume::Sender<ProxyEvent>,
         app_state: Arc<AppState>,
     ) -> anyhow::Result<Self> {
@@ -398,6 +435,8 @@ impl ProxyServer {
             http_public_addr,
             bind_addr,
             ports,
+            certificate_chain,
+            private_key,
             ambient_server_conn,
             server_message_sender,
             client_message_receiver,
@@ -522,7 +561,7 @@ impl ProxyServer {
         // base port selection on the ip and project id to favour reusing the same port
         let mut hasher = DefaultHasher::new();
         (external_endpoint.ip(), project_id.as_ref()).hash(&mut hasher);
-        let Ok(endpoint) = Self::create_proxy_endpoint(self.bind_addr, self.ports.clone(), hasher) else {
+        let Ok(endpoint) = Self::create_proxy_endpoint(self.bind_addr, self.ports.clone(), hasher, self.certificate_chain.clone(), self.private_key.clone()) else {
             return Err(anyhow::anyhow!("Failed to create proxy endpoint"));
         };
 

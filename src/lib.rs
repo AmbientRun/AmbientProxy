@@ -37,7 +37,7 @@ pub enum Error {
     #[error(transparent)]
     SendDatagramError(#[from] quinn::SendDatagramError),
     #[error(transparent)]
-    TLSError(rustls::Error),
+    TLSError(#[from] rustls::Error),
     // TODO: remove
     #[error(transparent)]
     Other(#[from] anyhow::Error),
