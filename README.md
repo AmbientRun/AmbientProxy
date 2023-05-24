@@ -26,7 +26,7 @@ Server code is behind `server` feature flag for easy use of this crate as a clie
 Proxy server supports overriding default configuration via environment variables. For testing it's recommended to use self signed certificates (included in the repository, configuration defaults to using them) and `bunyan` log format:
 
 ```sh
-RUST_LOG=info,ambient_proxy=trace LOG_FORMAT=bunyan cargo run --features server | bunyan
+RUST_LOG=info,ambient_proxy=trace LOG_FORMAT=bunyan AMBIENT_PROXY_HTTP_PUBLIC_HOST_NAME=127.0.0.1 cargo run --features server | bunyan
 ```
 
 Running server can be used by Ambient by setting CA certificate override and providing `--proxy` argument with proxy server address (note that for tls validation proxy needs to have a name, the self signed certificates use `localhost`). For example:
