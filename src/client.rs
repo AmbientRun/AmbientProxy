@@ -242,7 +242,7 @@ impl Client {
     ) -> crate::Result<Self> {
         let server_addr = lookup_host(proxy_server.clone())
             .await?
-            .next()
+            .find(|addr| addr.is_ipv4())
             .ok_or_else(|| anyhow::anyhow!("{:?} not found", proxy_server))?;
 
         let proxy_server = proxy_server.to_string();
