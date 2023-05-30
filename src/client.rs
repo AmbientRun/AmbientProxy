@@ -19,6 +19,7 @@ use tokio::{
 };
 
 use crate::{
+    bytes::to_binary_prefix,
     paths::{load_asset_data, path_to_key},
     protocol::{
         ClientMessage, ClientStreamHeader, DatagramInfo, ServerMessage, ServerStreamHeader,
@@ -76,6 +77,11 @@ async fn send_store_asset_message(
     };
 
     // write the header
+    tracing::debug!(
+        "Sending store asset message for key={} size={}B",
+        key,
+        to_binary_prefix(data.len() as u64)
+    );
     write_framed(
         &mut send_stream,
         &ClientStreamHeader::StoreAsset {
@@ -530,7 +536,7 @@ impl ClientController {
         let pre_caching_task_running = self.pre_caching_task_running.clone();
 
         tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             while tokio::time::Instant::now() < deadline {
                 let allocated = *endpoint_allocated.read();
                 if allocated {
