@@ -12,13 +12,14 @@ use bytes::Bytes;
 use flate2::{write::GzEncoder, Compression};
 use parking_lot::{Mutex, RwLock};
 use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, TransportConfig};
-use rustls::{Certificate, RootCertStore};
+use rustls::RootCertStore;
 use tokio::{
     net::{lookup_host, ToSocketAddrs},
     sync::Notify,
 };
 
 use crate::{
+    bytes::to_binary_prefix,
     paths::{load_asset_data, path_to_key},
     protocol::{
         ClientMessage, ClientStreamHeader, DatagramInfo, ServerMessage, ServerStreamHeader,
@@ -27,21 +28,28 @@ use crate::{
     streams::{read_framed, write_framed, IncomingStream, OutgoingStream},
 };
 
-const CERT: &[u8] = include_bytes!("./cert.der");
-
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 const MINIMUM_COMPRESSION_SIZE: usize = 1024;
 
 fn default_client_endpoint() -> crate::Result<Endpoint> {
     let mut endpoint = Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
-    let cert = Certificate(CERT.to_vec());
+    #[allow(unused_mut)]
     let mut roots = RootCertStore::empty();
-    roots.add(&cert).unwrap();
-    let crypto = rustls::ClientConfig::builder()
+    #[cfg(feature = "tls-roots")]
+    {
+        match rustls_native_certs::load_native_certs() {
+            Ok(certs) => roots.add_parsable_certificates(
+                &certs.into_iter().map(|cert| cert.0).collect::<Vec<_>>(),
+            ),
+            Err(error) => return Err(error.into()),
+        };
+    }
+    let mut crypto = rustls::ClientConfig::builder()
         .with_safe_defaults()
         .with_root_certificates(roots)
         .with_no_client_auth();
+    crypto.alpn_protocols = vec![b"ambient-proxy-03".to_vec()];
     let mut transport = TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs_f32(1.)));
     transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("Should fit in VarInt")));
@@ -69,6 +77,11 @@ async fn send_store_asset_message(
     };
 
     // write the header
+    tracing::debug!(
+        "Sending store asset message for key={} size={}B",
+        key,
+        to_binary_prefix(data.len() as u64)
+    );
     write_framed(
         &mut send_stream,
         &ClientStreamHeader::StoreAsset {
@@ -226,7 +239,7 @@ pub struct Client {
 }
 
 impl Client {
-    pub async fn connect<T: ToSocketAddrs + Debug + Clone>(
+    pub async fn connect<T: ToSocketAddrs + ToString + Debug + Clone>(
         proxy_server: T,
         project_id: String,
         assets_path: Option<PathBuf>,
@@ -235,11 +248,17 @@ impl Client {
     ) -> crate::Result<Self> {
         let server_addr = lookup_host(proxy_server.clone())
             .await?
-            .next()
+            .find(|addr| addr.is_ipv4())
             .ok_or_else(|| anyhow::anyhow!("{:?} not found", proxy_server))?;
 
+        let proxy_server = proxy_server.to_string();
+        let proxy_host = proxy_server
+            .split(':')
+            .next()
+            .unwrap_or(proxy_server.as_str());
+
         let conn = endpoint
-            .connect(server_addr, "localhost")
+            .connect(server_addr, proxy_host)
             .map_err(anyhow::Error::from)?
             .await?;
         let (send_stream, recv_stream) = conn.open_bi().await?;
@@ -517,7 +536,7 @@ impl ClientController {
         let pre_caching_task_running = self.pre_caching_task_running.clone();
 
         tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             while tokio::time::Instant::now() < deadline {
                 let allocated = *endpoint_allocated.read();
                 if allocated {

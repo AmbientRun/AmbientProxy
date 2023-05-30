@@ -1,6 +1,6 @@
 [package]
 name = "ambient_proxy"
-version = "0.3.0"
+version = "0.3.2"
 edition = "2021"
 authors = ["Kuba Jaroszewski <jakub.jaroszewski@gmail.com>"]
 description = "NAT traversal proxy for Ambient game engine"
@@ -37,7 +37,9 @@ quinn = "0.10"
 parking_lot = { version = "0.12", features = ["serde"] }
 prometheus-client = { version = "0.21", optional = true }
 rand = { version = "0.8.5", optional = true }
-rustls = { version = "0.21", features = ["dangerous_configuration", "quic"] }
+rustls = { version = "0.21", features = ["quic"] }
+rustls-native-certs = { version = "0.6.2", optional = true }
+rustls-pemfile = "1.0"
 reqwest = { version = "0.11", default-features = false, features = [
     "json",
     "rustls-tls",
@@ -77,3 +79,4 @@ server = [
     "tracing-stackdriver",
     "tracing-subscriber",
 ]
+tls-roots = ["rustls-native-certs"]
