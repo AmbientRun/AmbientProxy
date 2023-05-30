@@ -1,6 +1,6 @@
 [package]
 name = "ambient_proxy"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 authors = ["Kuba Jaroszewski <jakub.jaroszewski@gmail.com>"]
 description = "NAT traversal proxy for Ambient game engine"
