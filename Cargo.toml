@@ -5,7 +5,13 @@ edition = "2021"
 authors = ["Kuba Jaroszewski <jakub.jaroszewski@gmail.com>"]
 description = "NAT traversal proxy for Ambient game engine"
 repository = "https://github.com/Ambient/AmbientProxy"
-keywords = ["ambient", "game-development", "networking", "proxy", "nat-traversal"]
+keywords = [
+    "ambient",
+    "game-development",
+    "networking",
+    "proxy",
+    "nat-traversal",
+]
 categories = ["game-development"]
 readme = "README.md"
 license = "MIT OR Apache-2.0"
@@ -22,32 +28,55 @@ required-features = ["server"]
 anyhow = "1.0"
 axum = { version = "0.6", optional = true }
 bincode = "1.3"
-bytes = "1.1"
+bytes = "1.4"
 config = { version = "0.13", optional = true }
 flate2 = "1.0"
 flume = { version = "0.10", features = ["async"] }
 futures = { version = "0.3", default-features = false, features = ["std"] }
-quinn = "0.9"
+quinn = "0.10"
 parking_lot = { version = "0.12", features = ["serde"] }
-prometheus-client = { version = "0.20", optional = true }
-rand = { version = "0.8.0", optional = true }
-rustls = { version = "0.20", features = ["quic"] }
+prometheus-client = { version = "0.21", optional = true }
+rand = { version = "0.8.5", optional = true }
+rustls = { version = "0.21", features = ["quic"] }
 rustls-native-certs = { version = "0.6.2", optional = true }
 rustls-pemfile = "1.0"
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
-serde = { version = "1", features = ["derive"]}
+reqwest = { version = "0.11", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+serde = { version = "1", features = ["derive"] }
 thiserror = "1.0"
-tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal"]}
+tokio = { version = "1", features = [
+    "fs",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+] }
 tokio-util = { version = "0.7", features = ["codec"] }
 tower = { version = "0.4", optional = true }
-tower-http = { version = "0.3", features = ["cors", "fs"], optional = true }
+tower-http = { version = "0.4", features = ["cors", "fs"], optional = true }
 tracing = { version = "0.1", features = ["log"] }
 tracing-bunyan-formatter = { version = "0.3", optional = true }
 tracing-log = { version = "0.1", optional = true }
-tracing-stackdriver = { version = "0.6", optional = true }
-tracing-subscriber = { version = "0.3", features = ["registry", "env-filter"], optional = true }
+tracing-stackdriver = { version = "0.7", optional = true }
+tracing-subscriber = { version = "0.3", features = [
+    "registry",
+    "env-filter",
+], optional = true }
 uuid = { version = "1", features = ["serde", "v4"] }
 
 [features]
-server = ["axum", "config", "prometheus-client", "rand", "tower", "tower-http", "tracing-bunyan-formatter", "tracing-log", "tracing-stackdriver", "tracing-subscriber"]
+server = [
+    "axum",
+    "config",
+    "prometheus-client",
+    "rand",
+    "tower",
+    "tower-http",
+    "tracing-bunyan-formatter",
+    "tracing-log",
+    "tracing-stackdriver",
+    "tracing-subscriber",
+]
 tls-roots = ["rustls-native-certs"]

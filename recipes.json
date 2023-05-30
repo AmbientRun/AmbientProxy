@@ -1,0 +1,10 @@
+{
+    "run-server": {
+        "cmd": "cargo run --features server | bunyan",
+        "env": {
+            "RUST_LOG": "ambient_proxy=trace,info",
+            "LOG_FORMAT": "bunyan",
+            "RUST_BACKTRACE": 1
+        }
+    }
+}
