@@ -1,10 +1,10 @@
 [package]
 name = "ambient_proxy"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 authors = ["Kuba Jaroszewski <jakub.jaroszewski@gmail.com>"]
 description = "NAT traversal proxy for Ambient game engine"
-repository = "https://github.com/Ambient/AmbientProxy"
+repository = "https://github.com/AmbientRun/AmbientProxy"
 keywords = [
     "ambient",
     "game-development",
