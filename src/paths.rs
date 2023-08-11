@@ -52,7 +52,7 @@ mod tests {
 
     #[test]
     fn test_path_to_key() {
-        let eq = |path, key| assert_eq!(path_to_key(&PathBuf::from(path)).unwrap(), key);
+        let eq = |path, key| assert_eq!(path_to_key(PathBuf::from(path)).unwrap(), key);
 
         eq("abc", "abc");
         eq("abc/def", "abc/def");
@@ -61,8 +61,8 @@ mod tests {
 
     #[test]
     fn test_path_to_key_errors() {
-        assert!(path_to_key(&PathBuf::from("../abc")).is_err());
-        assert!(path_to_key(&PathBuf::from("abc/../def")).is_err());
-        assert!(path_to_key(&PathBuf::from("/abc")).is_err());
+        assert!(path_to_key(PathBuf::from("../abc")).is_err());
+        assert!(path_to_key(PathBuf::from("abc/../def")).is_err());
+        assert!(path_to_key(PathBuf::from("/abc")).is_err());
     }
 }
