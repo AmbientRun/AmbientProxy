@@ -1,11 +1,14 @@
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::hash_map::DefaultHasher,
     fmt::Debug,
     hash::{Hash, Hasher},
     io::Write,
     net::{IpAddr, SocketAddr, TcpListener},
     ops::RangeInclusive,
-    sync::{Arc, Weak},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Weak,
+    },
     time::Duration,
 };
 
@@ -17,6 +20,7 @@ use axum::{
     Json, Router,
 };
 use bytes::Bytes;
+use dashmap::DashMap;
 use flate2::write::GzDecoder;
 use flume::{Receiver, Sender};
 use futures::StreamExt;
@@ -70,27 +74,25 @@ impl AppState {
 
 #[derive(Default)]
 struct ProxyStore {
-    proxies: RwLock<HashMap<uuid::Uuid, (JoinHandle<()>, Arc<ProxyServer>)>>,
+    proxies: DashMap<uuid::Uuid, (JoinHandle<()>, Arc<ProxyServer>)>,
 }
 
 impl ProxyStore {
     fn insert(&self, id: uuid::Uuid, proxy: Arc<ProxyServer>, handle: JoinHandle<()>) -> usize {
-        let mut map = self.proxies.write();
-        map.insert(id, (handle, proxy));
-        map.len()
+        self.proxies.insert(id, (handle, proxy));
+        self.proxies.len()
     }
 
     fn get_proxy(&self, id: &uuid::Uuid) -> Option<Arc<ProxyServer>> {
-        self.proxies.read().get(id).map(|(_, proxy)| proxy).cloned()
+        self.proxies.get(id).map(|entry| entry.1.clone())
     }
 
     fn remove(&self, id: &uuid::Uuid) -> (usize, Option<Arc<ProxyServer>>) {
-        let mut map = self.proxies.write();
-        let proxy = map.remove(id).map(|(handle, proxy)| {
+        let proxy = self.proxies.remove(id).map(|(_, (handle, proxy))| {
             handle.abort();
             proxy
         });
-        (map.len(), proxy)
+        (self.proxies.len(), proxy)
     }
 
     fn fold_proxies<B, F>(&self, init: B, f: F) -> B
@@ -98,9 +100,8 @@ impl ProxyStore {
         F: FnMut(B, Arc<ProxyServer>) -> B,
     {
         self.proxies
-            .read()
             .iter()
-            .map(|(_, (_, proxy))| proxy.clone())
+            .map(|entry| entry.1.clone())
             .fold(init, f)
     }
 }
@@ -217,14 +218,14 @@ impl ManagementServer {
                 }
                 _ = metrics_update_interval.tick() => {
                     let client_connections_count = app_state.proxies.fold_proxies(0, |count, proxy| {
-                        count + proxy.player_conns.read().len()
+                        count + proxy.player_conns.len()
                     });
                     app_state.metrics.set_current_connections(ConnectionRole::Client, client_connections_count);
 
                     let assets_size = app_state.proxies.fold_proxies(0, |size, proxy| {
-                        size + proxy.total_assets_size()
+                        size + proxy.total_assets_size.load(Ordering::Relaxed)
                     });
-                    app_state.metrics.set_current_assets_size_bytes(assets_size);
+                    app_state.metrics.set_current_assets_size_bytes(assets_size as usize);
                 }
             }
         }
@@ -324,8 +325,9 @@ struct ProxyServer {
     message_processing_started_notify: Arc<Notify>,
     event_tx: flume::Sender<ProxyEvent>,
 
-    player_conns: RwLock<HashMap<String, (JoinHandle<()>, Arc<PlayerConnection>)>>,
-    asset_store: RwLock<HashMap<String, Asset>>,
+    player_conns: DashMap<String, (JoinHandle<()>, Arc<PlayerConnection>)>,
+    asset_store: DashMap<String, Asset>,
+    total_assets_size: AtomicU64,
     metrics: Metrics,
 }
 
@@ -449,6 +451,7 @@ impl ProxyServer {
             event_tx,
             player_conns: Default::default(),
             asset_store: Default::default(),
+            total_assets_size: Default::default(),
             metrics: app_state.metrics.clone(),
         })
     }
@@ -472,7 +475,7 @@ impl ProxyServer {
                 Some(conn) = self.accept_connection() => {
                     match self.handle_connection(conn, player_event_tx.clone()).await {
                         Ok((player_id, handle, connection)) => {
-                            self.player_conns.write().insert(player_id, (handle, connection));
+                            self.player_conns.insert(player_id, (handle, connection));
                             self.metrics.inc_connections(ConnectionRole::Client);
                         }
                         Err(err) => {
@@ -525,7 +528,7 @@ impl ProxyServer {
                 Ok(player_event) = player_event_rx.recv_async() => {
                     match player_event {
                         PlayerEvent::Disconnected { player_id } => {
-                            if let Some((handle, _)) = self.player_conns.write().remove(&player_id) {
+                            if let Some((_, (handle, _))) = self.player_conns.remove(&player_id) {
                                 handle.abort();
                             }
                         }
@@ -638,9 +641,8 @@ impl ProxyServer {
 
     fn get_player_connection(&self, player_id: &str) -> Option<Connection> {
         self.player_conns
-            .read()
             .get(player_id)
-            .map(|(_, p)| p.get_connection())
+            .map(|entry| entry.1.get_connection())
     }
 
     async fn handle_uni(
@@ -721,8 +723,10 @@ impl ProxyServer {
                     let size = data.len();
 
                     proxy_server
+                        .total_assets_size
+                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+                    proxy_server
                         .asset_store
-                        .write()
                         .entry(key.clone())
                         .or_default()
                         .store(data);
@@ -786,8 +790,7 @@ impl ProxyServer {
         while tokio::time::Instant::now() < deadline {
             let notify = {
                 // check if we already have the asset available
-                let mut map = self.asset_store.write();
-                let asset = map.entry(asset_id.clone()).or_default();
+                let asset = self.asset_store.entry(asset_id.clone()).or_default();
                 if let Some(asset_data) = asset.data.clone() {
                     return Ok(Some(asset_data));
                 }
@@ -822,18 +825,10 @@ impl ProxyServer {
     fn stats(&self) -> ProxyStats {
         ProxyStats {
             allocated_endpoint: self.allocated_endpoint.read().clone(),
-            total_assets_size: self.total_assets_size(),
-            total_assets_count: self.asset_store.read().len(),
-            players_count: self.player_conns.read().len(),
+            total_assets_size: self.total_assets_size.load(Ordering::Relaxed),
+            total_assets_count: self.asset_store.len(),
+            players_count: self.player_conns.len(),
         }
-    }
-
-    fn total_assets_size(&self) -> usize {
-        self.asset_store
-            .read()
-            .values()
-            .map(|asset| asset.data.as_ref().map(|data| data.len()).unwrap_or(0))
-            .sum()
     }
 }
 

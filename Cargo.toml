@@ -65,18 +65,8 @@ tracing-subscriber = { version = "0.3", features = [
     "env-filter",
 ], optional = true }
 uuid = { version = "1", features = ["serde", "v4"] }
+dashmap = "5.5.0"
 
 [features]
-server = [
-    "axum",
-    "config",
-    "prometheus-client",
-    "rand",
-    "tower",
-    "tower-http",
-    "tracing-bunyan-formatter",
-    "tracing-log",
-    "tracing-stackdriver",
-    "tracing-subscriber",
-]
+server = ["axum", "config", "prometheus-client", "rand", "tower", "tower-http", "tracing-bunyan-formatter", "tracing-log", "tracing-stackdriver", "tracing-subscriber"]
 tls-roots = ["rustls-native-certs"]

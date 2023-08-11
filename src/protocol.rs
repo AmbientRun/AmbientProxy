@@ -66,7 +66,7 @@ pub struct ProxyStats {
     /// The endpoint that the players should use to connect to the server via proxy
     pub allocated_endpoint: String,
     /// Total size of all assets
-    pub total_assets_size: usize,
+    pub total_assets_size: u64,
     /// Total number of assets
     pub total_assets_count: usize,
     /// Number of players currently connected via this proxy
