@@ -150,7 +150,7 @@ where
     let registry = Registry::default().with(env_filter);
     match std::env::var("LOG_FORMAT")
         .map(|v| v.to_lowercase())
-        .unwrap_or("stackdriver".to_string())
+        .unwrap_or_default()
         .as_str()
     {
         "bunyan" => {

@@ -23,20 +23,20 @@ Server code is behind `server` feature flag for easy use of this crate as a clie
 
 ## Testing proxy server
 
-Proxy server supports overriding default configuration via environment variables. For testing it's recommended to use self signed certificates (included in the repository, configuration defaults to using them) and `bunyan` log format:
+Proxy server supports overriding default configuration via environment variables. For testing it's recommended to use self signed certificates (included in the repository, configuration defaults to using them):
 
 ```sh
-RUST_LOG=info,ambient_proxy=trace LOG_FORMAT=bunyan AMBIENT_PROXY_HTTP_PUBLIC_HOST_NAME=127.0.0.1 cargo run --features server | bunyan
+RUST_LOG=ambient_proxy=trace,info cargo run --features server
 ```
 
 Running server can be used by Ambient by setting CA certificate override and providing `--proxy` argument with proxy server address (note that for tls validation proxy needs to have a name, the self signed certificates use `localhost`). For example:
 
 ```sh
-AMBIENT_PROXY_TEST_CA_CERT=../AmbientProxy/self-signed-certs/ca.der cargo run -- run --proxy localhost:7000 guest/rust/examples/games/minigolf
+AMBIENT_PROXY_TEST_CA_CERT=../AmbientProxy/self-signed-certs/ca.der ambient run --proxy localhost:7000 guest/rust/examples/games/minigolf
 ```
 
 Clients should be able to join the endpoint allocated by the proxy but they have to override CA certificate, for example:
 
 ```sh
-cargo run -- join --ca ../AmbientProxy/self-signed-certs/ca.der localhost:9529
+ambient join --ca ../AmbientProxy/self-signed-certs/ca.der localhost:9529
 ```
