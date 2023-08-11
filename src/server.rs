@@ -272,21 +272,17 @@ impl ManagementServer {
         tracing::info!("Got a new connection from: {:?}", conn.remote_address());
         let conn = conn.await?;
         let allocation_id = uuid::Uuid::new_v4();
-        let proxy_server = Arc::new(
-            ProxyServer::new(
-                allocation_id,
-                conn,
-                app_state.config.get_http_public_host_name(),
-                http_public_addr,
-                bind_addr,
-                app_state.config.proxy_port_range(),
-                certificate_chain,
-                private_key,
-                event_tx,
-                app_state,
-            )
-            .await?,
-        );
+        let proxy_config = ProxyConfig {
+            id: allocation_id,
+            bind_addr,
+            public_host_name: app_state.config.public_host_name.clone(),
+            http_public_addr,
+            certificate_chain,
+            private_key,
+            ports: app_state.config.proxy_port_range(),
+        };
+        let proxy_server =
+            Arc::new(ProxyServer::new(proxy_config, conn, event_tx, app_state).await?);
 
         // start the proxy server
         let handle = {
@@ -306,16 +302,24 @@ enum ProxyEvent {
     Stopped { id: uuid::Uuid },
 }
 
-struct ProxyServer {
+#[derive(Clone, Debug)]
+struct ProxyConfig {
     id: uuid::Uuid,
-    proxy_endpoint: RwLock<Option<Endpoint>>,
-    allocated_endpoint: RwLock<String>,
+    /// Hostname of the proxy server
     public_host_name: String,
+    /// Public hostname and port of the http server
     http_public_addr: String,
+    /// The address to bind to
     bind_addr: IpAddr,
     ports: RangeInclusive<u16>,
     certificate_chain: Vec<Certificate>,
     private_key: PrivateKey,
+}
+
+struct ProxyServer {
+    config: ProxyConfig,
+    proxy_endpoint: RwLock<Option<Endpoint>>,
+    allocated_endpoint: RwLock<String>,
 
     ambient_server_conn: Connection,
     server_message_sender: Sender<ServerMessage>,
@@ -335,11 +339,8 @@ impl ProxyServer {
     const BIND_ATTEMPTS: i32 = 10;
 
     fn create_proxy_endpoint(
-        addr: IpAddr,
-        ports: RangeInclusive<u16>,
+        config: ProxyConfig,
         mut allocation_seed: impl Hasher,
-        cert_chain: Vec<Certificate>,
-        cert_key: PrivateKey,
     ) -> anyhow::Result<Endpoint> {
         let mut tls_config = rustls::ServerConfig::builder()
             .with_safe_default_cipher_suites()
@@ -347,7 +348,7 @@ impl ProxyServer {
             .with_protocol_versions(&[&rustls::version::TLS13])
             .unwrap()
             .with_no_client_auth()
-            .with_single_cert(cert_chain, cert_key)?;
+            .with_single_cert(config.certificate_chain, config.private_key)?;
         tls_config.max_early_data_size = u32::MAX;
         tls_config.alpn_protocols = vec![b"ambient-02".to_vec()];
 
@@ -357,12 +358,12 @@ impl ProxyServer {
         server_conf.transport = Arc::new(transport);
 
         // pick a port
-        let ports_len = *ports.end() - *ports.start() + 1;
+        let ports_len = *config.ports.end() - *config.ports.start() + 1;
         for attempt in 0..Self::BIND_ATTEMPTS {
             attempt.hash(&mut allocation_seed);
-            let port = *ports.start() + (allocation_seed.finish() as u16) % ports_len;
-            debug_assert!(ports.contains(&port));
-            let server_addr = SocketAddr::from((addr, port));
+            let port = *config.ports.start() + (allocation_seed.finish() as u16) % ports_len;
+            debug_assert!(config.ports.contains(&port));
+            let server_addr = SocketAddr::from((config.bind_addr, port));
             if let Ok(endpoint) = Endpoint::server(server_conf.clone(), server_addr) {
                 return Ok(endpoint);
             }
@@ -372,14 +373,8 @@ impl ProxyServer {
     }
 
     async fn new(
-        id: uuid::Uuid,
+        config: ProxyConfig,
         ambient_server_conn: Connection,
-        public_host_name: String,
-        http_public_addr: String,
-        bind_addr: IpAddr,
-        ports: RangeInclusive<u16>,
-        certificate_chain: Vec<Certificate>,
-        private_key: PrivateKey,
         event_tx: flume::Sender<ProxyEvent>,
         app_state: Arc<AppState>,
     ) -> anyhow::Result<Self> {
@@ -433,15 +428,9 @@ impl ProxyServer {
         };
 
         Ok(Self {
-            id,
+            config,
             proxy_endpoint: Default::default(),
             allocated_endpoint: Default::default(),
-            public_host_name,
-            http_public_addr,
-            bind_addr,
-            ports,
-            certificate_chain,
-            private_key,
             ambient_server_conn,
             server_message_sender,
             client_message_receiver,
@@ -538,7 +527,7 @@ impl ProxyServer {
                 // ambient server connection closed
                 err = self.ambient_server_conn.closed() => {
                     tracing::info!("Server connection closed: {:?}", err);
-                    if let Err(err) = self.event_tx.send_async(ProxyEvent::Stopped { id: self.id }).await {
+                    if let Err(err) = self.event_tx.send_async(ProxyEvent::Stopped { id: self.config.id }).await {
                         tracing::error!("Failed to send proxy stopped event: {:?}", err);
                     }
                     break;
@@ -546,7 +535,7 @@ impl ProxyServer {
 
                 else => {
                     tracing::info!("Proxy server is shutting down");
-                    if let Err(err) = self.event_tx.send_async(ProxyEvent::Stopped { id: self.id }).await {
+                    if let Err(err) = self.event_tx.send_async(ProxyEvent::Stopped { id: self.config.id }).await {
                         tracing::error!("Failed to send proxy stopped event: {:?}", err);
                     }
                     break;
@@ -567,7 +556,7 @@ impl ProxyServer {
         // base port selection on the ip and project id to favour reusing the same port
         let mut hasher = DefaultHasher::new();
         (external_endpoint.ip(), project_id.as_ref()).hash(&mut hasher);
-        let Ok(endpoint) = Self::create_proxy_endpoint(self.bind_addr, self.ports.clone(), hasher, self.certificate_chain.clone(), self.private_key.clone()) else {
+        let Ok(endpoint) = Self::create_proxy_endpoint(self.config.clone(), hasher) else {
             return Err(anyhow::anyhow!("Failed to create proxy endpoint"));
         };
 
@@ -575,14 +564,17 @@ impl ProxyServer {
         let Ok(local_addr) = endpoint.local_addr() else {
             return Err(anyhow::anyhow!("Failed to get local address"));
         };
-        let allocated_endpoint = format!("{}:{}", self.public_host_name, local_addr.port());
+        let allocated_endpoint = format!("{}:{}", self.config.public_host_name, local_addr.port());
         *self.allocated_endpoint.write() = allocated_endpoint.clone();
 
         Ok(ServerMessage::Allocation {
-            id: self.id,
+            id: self.config.id,
             allocated_endpoint,
             external_endpoint,
-            assets_root: format!("http://{}/content/{}/", self.http_public_addr, self.id),
+            assets_root: format!(
+                "http://{}/content/{}/",
+                self.config.http_public_addr, self.config.id
+            ),
         })
     }
 
@@ -834,7 +826,7 @@ impl ProxyServer {
 
 impl Drop for ProxyServer {
     fn drop(&mut self) {
-        tracing::info!("Shutting down proxy server: {}", self.id);
+        tracing::info!("Shutting down proxy server: {}", self.config.id);
 
         // abort the message processing task
         self.message_processing_handle.abort();

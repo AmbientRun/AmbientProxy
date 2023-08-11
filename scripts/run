@@ -1,0 +1,3 @@
+#!/bin/sh
+
+RUST_LOG=ambient_proxy=trace,info cargo run --features server
