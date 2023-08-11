@@ -81,13 +81,8 @@ impl Metrics {
                 "Size of asset responses",
                 Histogram::new(
                     (0..10)
-                        .into_iter()
                         .map(|i| 1024.0 * 2.0f64.powi(i))
-                        .chain(
-                            (0..10)
-                                .into_iter()
-                                .map(|i| 1024.0 * 1024.0 * 2.0f64.powi(i)),
-                        )
+                        .chain((0..10).map(|i| 1024.0 * 1024.0 * 2.0f64.powi(i)))
                         .chain([1024_f64.powi(3)].into_iter()),
                 ),
             ),
