@@ -59,3 +59,16 @@ pub struct DatagramInfo {
     /// Recipient/origin of the datagram
     pub player_id: String,
 }
+
+/// Stats returned from /stats/ALLOCATION_ID endpoint
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ProxyStats {
+    /// The endpoint that the players should use to connect to the server via proxy
+    pub allocated_endpoint: String,
+    /// Total size of all assets
+    pub total_assets_size: usize,
+    /// Total number of assets
+    pub total_assets_count: usize,
+    /// Number of players currently connected via this proxy
+    pub players_count: usize,
+}

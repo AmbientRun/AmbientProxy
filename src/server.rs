@@ -14,7 +14,7 @@ use axum::{
     extract::{Path, State},
     http::{Method, StatusCode},
     routing::get,
-    Router,
+    Json, Router,
 };
 use bytes::Bytes;
 use flate2::write::GzDecoder;
@@ -38,8 +38,8 @@ use crate::{
     configuration::Settings,
     friendly_id::friendly_id,
     protocol::{
-        ClientMessage, ClientStreamHeader, DatagramInfo, ServerMessage, ServerStreamHeader,
-        GZIP_COMPRESSION,
+        ClientMessage, ClientStreamHeader, DatagramInfo, ProxyStats, ServerMessage,
+        ServerStreamHeader, GZIP_COMPRESSION,
     },
     streams::{read_framed, spawn_stream_copy, write_framed, IncomingStream, OutgoingStream},
     telemetry::{AssetRequestResult, ConnectionRole, Metrics},
@@ -241,6 +241,7 @@ impl ManagementServer {
             .route("/ping", get(|| async move { "ok" }))
             .route("/content/:id/*path", get(get_asset))
             .route("/metrics", get(get_metrics))
+            .route("/stats/:id", get(get_stats))
             .with_state(app_state)
             .layer(
                 CorsLayer::new()
@@ -307,6 +308,7 @@ enum ProxyEvent {
 struct ProxyServer {
     id: uuid::Uuid,
     proxy_endpoint: RwLock<Option<Endpoint>>,
+    allocated_endpoint: RwLock<String>,
     public_host_name: String,
     http_public_addr: String,
     bind_addr: IpAddr,
@@ -431,6 +433,7 @@ impl ProxyServer {
         Ok(Self {
             id,
             proxy_endpoint: Default::default(),
+            allocated_endpoint: Default::default(),
             public_host_name,
             http_public_addr,
             bind_addr,
@@ -569,9 +572,12 @@ impl ProxyServer {
         let Ok(local_addr) = endpoint.local_addr() else {
             return Err(anyhow::anyhow!("Failed to get local address"));
         };
+        let allocated_endpoint = format!("{}:{}", self.public_host_name, local_addr.port());
+        *self.allocated_endpoint.write() = allocated_endpoint.clone();
+
         Ok(ServerMessage::Allocation {
             id: self.id,
-            allocated_endpoint: format!("{}:{}", self.public_host_name, local_addr.port()),
+            allocated_endpoint,
             external_endpoint,
             assets_root: format!("http://{}/content/{}/", self.http_public_addr, self.id),
         })
@@ -813,6 +819,15 @@ impl ProxyServer {
         Err(anyhow::anyhow!("Timed out getting asset: {}", asset_id))
     }
 
+    fn stats(&self) -> ProxyStats {
+        ProxyStats {
+            allocated_endpoint: self.allocated_endpoint.read().clone(),
+            total_assets_size: self.total_assets_size(),
+            total_assets_count: self.asset_store.read().len(),
+            players_count: self.player_conns.read().len(),
+        }
+    }
+
     fn total_assets_size(&self) -> usize {
         self.asset_store
             .read()
@@ -988,11 +1003,12 @@ impl Asset {
     }
 }
 
+#[tracing::instrument(skip(app_state))]
 async fn get_asset(
     Path((id, path)): Path<(String, String)>,
     State(app_state): State<Arc<AppState>>,
 ) -> Result<Bytes, StatusCode> {
-    tracing::debug!("get_asset: {} {}", id, path);
+    tracing::debug!("get_asset");
     let Ok(allocation_id) = uuid::Uuid::try_from(id.as_str()) else {
         tracing::warn!("Invalid allocation id: {}", id);
         app_state.metrics.inc_asset_requests(AssetRequestResult::Malformed);
@@ -1050,4 +1066,20 @@ async fn get_metrics(
         ),
     );
     Ok(response)
+}
+
+#[tracing::instrument(skip(app_state))]
+async fn get_stats(
+    Path(id): Path<String>,
+    State(app_state): State<Arc<AppState>>,
+) -> Result<Json<ProxyStats>, StatusCode> {
+    let Ok(allocation_id) = uuid::Uuid::try_from(id.as_str()) else {
+        tracing::warn!("Invalid allocation id: {}", id);
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let Some(proxy_server) = app_state.proxies.get_proxy(&allocation_id) else {
+        tracing::debug!("Unknown allocation id: {}", id);
+        return Err(StatusCode::NOT_FOUND);
+    };
+    Ok(Json(proxy_server.stats()))
 }
